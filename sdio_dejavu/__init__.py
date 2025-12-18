@@ -9,6 +9,7 @@ import numpy as np
 from hashlib import sha1
 import concurrent
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import date, timedelta
 import sdio_dejavu.logic.decoder as decoder
 from sdio_dejavu.base_classes.base_database import get_database
 from sdio_dejavu.config.settings import (DEFAULT_FS, DEFAULT_OVERLAP_RATIO,
@@ -231,6 +232,22 @@ class Dejavu:
         pool.close()
         pool.join()
 
+    def get_fingerprint_hash(
+            self,
+            file_path:str,
+            song_name:str = ""
+            ):
+        try:
+            _, hashes, _ = Dejavu._fingerprint_worker(
+                    file_path,
+                    self.limit,
+                    song_name=song_name
+                )
+        except Exception as e:
+            logger.exception(f"Failed generating fingerprint for file {file_path} {e}")
+            return None
+        return hashes
+
     def fingerprint_file(self, file_path: str, song_name: str = None) -> None:
         """
         Given a path to a file the method generates hashes for it and stores them in the database
@@ -299,6 +316,77 @@ class Dejavu:
         query_time = time.time() - t
 
         return matches, dedup_hashes, query_time
+
+    def find_similar_cms(
+        self,
+        media_path: str,
+        days: int,
+        threshold: float = 0.1,
+    ) -> list[str]:
+        """
+        Find similar CMs by fingerprinting a media file and
+        searching fingerprints_yyyy_mm_dd tables from today backwards.
+
+        Returns a list of matched song_name (deduplicated).
+        """
+
+        # --------------------------------------------------
+        # 1. Generate fingerprint hashes ONCE
+        # --------------------------------------------------
+        logger.info(f"Generating fingerprint for {media_path}")
+
+        hashes = self.get_fingerprint_hash(media_path)
+        if not hashes:
+            logger.warning("No fingerprint hashes generated")
+            return []
+
+        logger.info(f"Fingerprint hashes: {len(hashes)}")
+
+        matched_songs = set()
+
+        today = date.today()
+
+        # --------------------------------------------------
+        # 2. Iterate over days (today -> today - days)
+        # --------------------------------------------------
+        for i in range(days):
+            d = today - timedelta(days=i)
+            table_name = f"fingerprints_{d.strftime('%Y_%m_%d')}"
+
+            logger.debug(f"Searching table {table_name}")
+
+            try:
+                matches, dedup_hashes, _ = self.find_matches_by_table(
+                    hashes,
+                    table_name,
+                )
+            except Exception as e:
+                logger.debug(f"Skip table {table_name}: {e}")
+                continue
+
+            if not matches:
+                continue
+
+            # --------------------------------------------------
+            # 3. Align matches & filter by confidence
+            # --------------------------------------------------
+            results = self.align_matches(
+                matches,
+                dedup_hashes,
+                queried_hashes=len(hashes),
+                confidence_threshold=threshold,
+            )
+
+            for res in results:
+                try:
+                    song_name = res[SONG_NAME].decode("utf8")
+                except Exception:
+                    song_name = str(res[SONG_NAME])
+
+                matched_songs.add(song_name)
+
+        return sorted(matched_songs)
+
 
     def find_similar_ads(
         self, 
