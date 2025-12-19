@@ -360,6 +360,36 @@ class Dejavu:
         return sorted(matched_songs)
 
 
+    def find_similar_ads_by_table_name(
+        self,
+        song_name: str,
+        table_name:str,
+        threshold: float = 0.1,
+    ) -> list[str]:
+        """
+        Find similar ads by reusing find_similar_ads across multiple daily tables.
+
+        - If target_day is None: search from today backwards
+        - If target_day is set: search from target_day backwards
+
+        Returns deduplicated list of similar song_name.
+        """
+        logger.debug(
+            f"Searching similar ads for {song_name} in {table_name}"
+        )
+
+        try:
+            results = self.find_similar_ads(
+                song_name=song_name,
+                table_name=table_name,
+                confidence_threshold=threshold,
+            )
+        except Exception as e:
+            # table not exist / query failed
+            logger.debug(f"Skip table {table_name}: {e}")
+
+        return results
+
     def find_similar_cms(
         self,
         media_path: str,
