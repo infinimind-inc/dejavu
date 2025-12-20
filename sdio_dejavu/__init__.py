@@ -316,6 +316,27 @@ class Dejavu:
 
         return matches, dedup_hashes, query_time
 
+    def find_similar_ads_by_hashes(
+        self,
+        hashes: list[tuple[str, int]],
+        table_name: str,
+        confidence_threshold=0.1,
+    ) -> list[str]:
+        if not hashes:
+            return []
+
+        matches, dedup_hashes, _ = self.find_matches_by_table(hashes, table_name)
+
+        results = self.align_matches(
+            matches,
+            dedup_hashes,
+            queried_hashes=len(hashes),
+            confidence_threshold=confidence_threshold,
+        )
+
+        return [res[SONG_NAME].decode("utf8") for res in results]
+
+
     def find_similar_ads_by_days(
         self,
         song_name: str,
