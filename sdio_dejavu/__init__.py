@@ -322,42 +322,120 @@ class Dejavu:
         threshold: float = 0.1,
         target_day: date | None = None,
     ) -> list[str]:
-        """
-        Find similar ads by reusing find_similar_ads across multiple daily tables.
-
-        - If target_day is None: search from today backwards
-        - If target_day is set: search from target_day backwards
-
-        Returns deduplicated list of similar song_name.
-        """
 
         start_day = target_day or date.today()
         matched_songs = set()
+
+        hashes = self.get_fingerprints_for_song(song_name)
+        if not hashes:
+            return []
 
         for i in range(days):
             d = start_day - timedelta(days=i)
             table_name = f"fingerprints_{d.strftime('%Y_%m_%d')}"
 
-            logger.debug(
-                f"Searching similar ads for {song_name} in {table_name}"
-            )
-
             try:
-                results = self.find_similar_ads(
-                    song_name=song_name,
+                results = self.find_similar_ads_by_hashes(
+                    hashes=hashes,
                     table_name=table_name,
                     confidence_threshold=threshold,
                 )
             except Exception as e:
-                # table not exist / query failed
                 logger.debug(f"Skip table {table_name}: {e}")
                 continue
 
             for r in results:
-                matched_songs.add(r)
-
+                if r != song_name: 
+                    matched_songs.add(r)
 
         return sorted(matched_songs)
+
+    def _parse_day_from_song_name(song_name: str) -> date | None:
+        """
+        Extract yyyyMMdd from song_name like:
+        xx_yyyymmdd_hhmmss_xx_xx
+        """
+        try:
+            parts = song_name.split("_")
+            ymd = parts[1]            # yyyymmdd
+            return date(
+                int(ymd[0:4]),
+                int(ymd[4:6]),
+                int(ymd[6:8]),
+            )
+        except Exception:
+            return None
+
+    def _candidate_fingerprint_tables(song_name: str) -> list[str]:
+        d = _parse_day_from_song_name(song_name)
+        if not d:
+            return []
+
+        days = [d, d + timedelta(days=1), d - timedelta(days=1)]
+        return [
+            f"fingerprints_{day.strftime('%Y_%m_%d')}"
+            for day in days
+        ]
+
+    @lru_cache(maxsize=1)
+    def _get_song_map(self) -> dict[str, dict]:
+        """
+        Cache song_name -> song row mapping.
+
+        Returns:
+            {
+              song_name: {
+                song_id: ...,
+                song_name: ...,
+                ...
+              }
+            }
+        """
+        with self.db.cursor(dictionary=True) as cur:
+            cur.execute(
+                'SELECT * FROM songs;'
+            )
+            rows = cur.fetchall()
+
+        return {row["song_name"]: row for row in rows}
+
+    def refresh_song_map(self) -> None:
+        """Call this if songs table is updated."""
+        self._get_song_map.cache_clear()
+
+    def get_fingerprints_for_song(self, song_name: str) -> list[tuple[str, int]]:
+        """
+        Fast path: only search 1–3 daily partitions inferred from song_name.
+        """
+        songs = self._get_song_map()   # 强烈建议缓存
+        if song_name not in songs:
+            return []
+
+        song_id = songs[song_name][SONG_ID]
+        tables = _candidate_fingerprint_tables(song_name)
+
+        if not tables:
+            return []
+
+        with self.db.cursor(dictionary=True) as cur:
+            for table in tables:
+                try:
+                    cur.execute(
+                        f'''
+                        SELECT upper(encode("hash",'hex')) AS hash, "offset"
+                        FROM {table}
+                        WHERE song_id = %s
+                        ''',
+                        (song_id,),
+                    )
+                    rows = cur.fetchall()
+                    if rows:
+                        return [(r["hash"], r["offset"]) for r in rows]
+                except Exception:
+                    # table may not exist
+                    continue
+
+        return []
 
 
     def find_similar_ads_by_table_name(
@@ -485,6 +563,28 @@ class Dejavu:
 
 
         return sorted(matched_songs)
+
+    def get_fingerprints_by_songs(self, song_names: list[str]):
+        with self.db.cursor(dictionary=True) as cur:
+            cur.execute(
+                f'''
+                SELECT s.song_name,
+                    upper(encode(f."hash",'hex')) AS hash,
+                    f."offset"
+                FROM fingerprints f
+                JOIN songs s ON f.song_id = s.song_id
+                WHERE s.song_name = ANY(%s)
+                ''',
+                (song_names,)
+            )
+            rows = cur.fetchall()
+
+        fp_map = {}
+        for r in rows:
+            fp_map.setdefault(r["song_name"], []).append(
+                (r["hash"], r["offset"])
+            )
+        return fp_map
 
 
     def find_similar_ads(
