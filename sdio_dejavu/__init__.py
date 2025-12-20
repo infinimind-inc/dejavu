@@ -341,6 +341,8 @@ class Dejavu:
                     table_name=table_name,
                     confidence_threshold=threshold,
                 )
+                if not results:
+                    continue
             except Exception as e:
                 logger.debug(f"Skip table {table_name}: {e}")
                 continue
@@ -351,7 +353,7 @@ class Dejavu:
 
         return sorted(matched_songs)
 
-    def _parse_day_from_song_name(song_name: str) -> date | None:
+    def _parse_day_from_song_name(self,song_name: str) -> date | None:
         """
         Extract yyyyMMdd from song_name like:
         xx_yyyymmdd_hhmmss_xx_xx
@@ -367,8 +369,8 @@ class Dejavu:
         except Exception:
             return None
 
-    def _candidate_fingerprint_tables(song_name: str) -> list[str]:
-        d = _parse_day_from_song_name(song_name)
+    def _candidate_fingerprint_tables(self,song_name: str) -> list[str]:
+        d = self._parse_day_from_song_name(song_name)
         if not d:
             return []
 
@@ -413,7 +415,7 @@ class Dejavu:
             return []
 
         song_id = songs[song_name][SONG_ID]
-        tables = _candidate_fingerprint_tables(song_name)
+        tables = self._candidate_fingerprint_tables(song_name)
 
         if not tables:
             return []
