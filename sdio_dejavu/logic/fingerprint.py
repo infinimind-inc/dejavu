@@ -1,6 +1,6 @@
 import hashlib
 from operator import itemgetter
-from typing import List, Tuple
+from typing import List, Tuple,Optional
 
 import matplotlib.mlab as mlab
 import matplotlib.pyplot as plt
@@ -154,3 +154,111 @@ def generate_hashes(peaks: List[Tuple[int, int]], fan_value: int = DEFAULT_FAN_V
                     hashes.append((h.hexdigest()[0:FINGERPRINT_REDUCTION], t1))
 
     return hashes
+
+def hex2int64(hex_str: str) -> int:
+    """
+    Convert hex string to signed int64.
+    Logic is IDENTICAL to:
+    ('x' || substring(hex FROM 1 FOR 16))::bit(64)::bigint
+    """
+    if len(hex_str) < 16:
+        raise ValueError("hex string too short for int64")
+
+    # take first 64 bits (16 hex chars)
+    h = hex_str[:16]
+
+    val = int(h, 16)
+
+    # convert to signed int64 (two's complement)
+    if val >= 1 << 63:
+        val -= 1 << 64
+
+    return val
+
+
+def filter_result(
+        results_list: list[dict],
+        threshold: float = 0.3,
+        min_matched_hashes: Optional[int] = None,
+        max_offset_abs: Optional[int] = None,
+        top_k: Optional[int] = None,
+    ) -> list[dict]:
+        """
+        Filter and sort fingerprint matching results.
+
+        Args:
+            results_list: raw dejavu results (list of dict)
+            threshold: minimum input_confidence
+            min_matched_hashes: minimum hashes_matched_in_input
+            max_offset_abs: max absolute offset (in frames, not seconds)
+            top_k: return only top K results after sorting
+
+        Returns:
+            List[dict]: filtered & sorted results
+        """
+
+        filtered = []
+
+        for r in results_list:
+            # ---- normalize & extract ----
+            input_conf = float(r.get("input_confidence", 0.0))
+            matched = int(r.get("hashes_matched_in_input", 0))
+            offset = int(r.get("offset", 0))
+            offset_sec = float(r.get("offset_seconds", 0.0))
+
+            # ---- basic filters ----
+            if input_conf < threshold:
+                continue
+
+            if min_matched_hashes is not None and matched < min_matched_hashes:
+                continue
+
+            if max_offset_abs is not None and abs(offset) > max_offset_abs:
+                continue
+            cm_name = r.get("song_name")
+            if isinstance(cm_name, (bytes, bytearray)):
+                cm_name = cm_name.decode("utf-8", errors="ignore")
+            # ---- normalized record ----
+            filtered.append({
+                "cm_id": r.get("song_id"),
+                "cm_name": cm_name,
+                "matched_hashes": matched,
+                "input_total_hashes": int(r.get("input_total_hashes", 0)),
+                "input_confidence": input_conf,
+                "fingerprinted_confidence": float(r.get("fingerprinted_confidence", 0.0)),
+                "offset": offset,
+                "offset_seconds": offset_sec,
+                "file_sha1": r.get("file_sha1"),
+            })
+
+        # ---- sorting strategy ----
+        # 1. highest confidence first
+        # 2. then highest matched hashes
+        # 3. then smallest |offset|
+        filtered.sort(
+            key=lambda x: (
+                -x["input_confidence"],
+                -x["matched_hashes"],
+                abs(x["offset"]),
+            )
+        )
+
+        if top_k is not None:
+            filtered = filtered[:top_k]
+
+        return filtered
+
+def enrich_hash64(
+    items: list[Tuple[str, int]]
+) -> list[Tuple[str, int, int]]:
+    """
+    Input:  [(hex_hash, offset), ...]
+    Output: [(hex_hash, hash64, offset), ...]
+    """
+    out = []
+
+    for hex_hash, offset in items:
+        hash64 = hex2int64(hex_hash)
+        out.append((hex_hash, hash64, int(offset)))
+
+    return out

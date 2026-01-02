@@ -31,7 +31,7 @@ DATABASES = {
 }
 
 # TABLE SONGS
-SONGS_TABLENAME = "songs"
+SONGS_TABLENAME = "fp_creatives"
 
 # SONGS FIELDS
 FIELD_SONG_ID = 'song_id'
@@ -41,10 +41,11 @@ FIELD_FILE_SHA1 = 'file_sha1'
 FIELD_TOTAL_HASHES = 'total_hashes'
 
 # TABLE FINGERPRINTS
-FINGERPRINTS_TABLENAME = "fingerprints"
+FINGERPRINTS_TABLENAME = "fp_audio_fingerprints"
 
 # FINGERPRINTS FIELDS
 FIELD_HASH = 'hash'
+FIELD_HASH64 = 'hash64'
 FIELD_OFFSET = 'offset'
 
 # FINGERPRINTS CONFIG:
@@ -54,14 +55,16 @@ FIELD_OFFSET = 'offset'
 # Where 1 sets a diamond morphology which implies that diagonal elements are not considered as neighbors (this
 # is the value used in the original dejavu code).
 # And 2 sets a square mask, i.e. all elements are considered neighbors.
-CONNECTIVITY_MASK = 2
+CONNECTIVITY_MASK = 1
+
+DAILY_PARTITION = 0
 
 # Sampling rate, related to the Nyquist conditions, which affects
 # the range frequencies we can detect.
-DEFAULT_FS = 44100
+DEFAULT_FS = 8000
 
 # Size of the FFT window, affects frequency granularity
-DEFAULT_WINDOW_SIZE = 2048
+DEFAULT_WINDOW_SIZE = 1024
 
 # Ratio by which each sequential window overlaps the last and the
 # next window. Higher overlap will allow a higher granularity of offset
@@ -70,23 +73,23 @@ DEFAULT_OVERLAP_RATIO = 0.5
 
 # Degree to which a fingerprint can be paired with its neighbors. Higher values will
 # cause more fingerprints, but potentially better accuracy.
-DEFAULT_FAN_VALUE = 5  # 15 was the original value.
+DEFAULT_FAN_VALUE = 3  # 15 was the original value.
 
 # Minimum amplitude in spectrogram in order to be considered a peak.
 # This can be raised to reduce number of fingerprints, but can negatively
 # affect accuracy.
-DEFAULT_AMP_MIN = 10
+DEFAULT_AMP_MIN = 12
 
 # Number of cells around an amplitude peak in the spectrogram in order
 # for Dejavu to consider it a spectral peak. Higher values mean less
 # fingerprints and faster matching, but can potentially affect accuracy.
-PEAK_NEIGHBORHOOD_SIZE = 10  # 20 was the original value.
+PEAK_NEIGHBORHOOD_SIZE = 15  # 20 was the original value.
 
 # Thresholds on how close or far fingerprints can be in time in order
 # to be paired as a fingerprint. If your max is too low, higher values of
 # DEFAULT_FAN_VALUE may not perform as expected.
 MIN_HASH_TIME_DELTA = 0
-MAX_HASH_TIME_DELTA = 200
+MAX_HASH_TIME_DELTA = 100
 
 # If True, will sort peaks temporally for fingerprinting;
 # not sorting will cut down number of fingerprints, but potentially

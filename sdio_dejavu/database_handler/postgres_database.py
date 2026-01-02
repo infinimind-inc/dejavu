@@ -6,8 +6,9 @@ from datetime import datetime, timedelta
 from sdio_dejavu.base_classes.common_database import CommonDatabase
 from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
                                     FIELD_HASH, FIELD_OFFSET, FIELD_SONG_ID,
+                                    FIELD_HASH64,
                                     FIELD_SONGNAME, FIELD_TOTAL_HASHES,
-                                    FINGERPRINTS_TABLENAME, SONGS_TABLENAME)
+                                    FINGERPRINTS_TABLENAME, SONGS_TABLENAME,DAILY_PARTITION)
 
 
 class PostgreSQLDatabase(CommonDatabase):
@@ -45,6 +46,20 @@ class PostgreSQLDatabase(CommonDatabase):
     ON "{FINGERPRINTS_TABLENAME}" USING hash ("{FIELD_HASH}");
     """
 
+    CREATE_FINGERPRINTS_TABLE_DEFAULT = f"""
+    CREATE TABLE IF NOT EXISTS "{FINGERPRINTS_TABLENAME}" (
+        "{FIELD_HASH}" BYTEA NOT NULL,
+        "{FIELD_SONG_ID}" INT NOT NULL,
+        "{FIELD_OFFSET}" INT NOT NULL,
+        "date_created" TIMESTAMP NOT NULL DEFAULT now(),
+        "date_modified" TIMESTAMP NOT NULL DEFAULT now(),
+        CONSTRAINT "uq_{FINGERPRINTS_TABLENAME}" UNIQUE ("{FIELD_SONG_ID}", "{FIELD_OFFSET}", "{FIELD_HASH}", "date_created"),
+        CONSTRAINT "fk_{FINGERPRINTS_TABLENAME}_{FIELD_SONG_ID}" FOREIGN KEY ("{FIELD_SONG_ID}")
+        REFERENCES "{SONGS_TABLENAME}"("{FIELD_SONG_ID}") ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS "ix_{FINGERPRINTS_TABLENAME}_{FIELD_HASH}"
+    ON "{FINGERPRINTS_TABLENAME}" USING hash ("{FIELD_HASH}");
+    """
 
     CREATE_FINGERPRINTS_TABLE_INDEX = f"""
         CREATE INDEX "ix_{FINGERPRINTS_TABLENAME}_{FIELD_HASH}" ON "{FINGERPRINTS_TABLENAME}"
@@ -77,6 +92,24 @@ class PostgreSQLDatabase(CommonDatabase):
         SELECT upper(encode("{FIELD_HASH}", 'hex')), "{FIELD_SONG_ID}", "{FIELD_OFFSET}"
         FROM "{FINGERPRINTS_TABLENAME}"
         WHERE "{FIELD_HASH}" IN (%s);
+    """
+
+    SELECT_MULTIPLE_INT64 = f"""
+    SELECT "{FIELD_HASH64}", "{FIELD_SONG_ID}", "{FIELD_OFFSET}"
+    FROM "{FINGERPRINTS_TABLENAME}"
+    WHERE "{FIELD_HASH64}" IN (%s);
+    """
+
+    SELECT_FINGERPRINTS_BY_SONG_NAME = f"""
+        SELECT
+            UPPER(ENCODE(f."{FIELD_HASH}", 'hex')) AS hash_hex,
+            f."{FIELD_HASH64}",
+            f."{FIELD_OFFSET}"
+        FROM "{FINGERPRINTS_TABLENAME}" f
+        JOIN "{SONGS_TABLENAME}" c
+            ON f."{FIELD_SONG_ID}" = c."{FIELD_SONG_ID}"
+        WHERE c."{FIELD_SONGNAME}" = %s
+        ORDER BY f."{FIELD_OFFSET}";
     """
 
     SELECT_MULTIPLE1 = f"""
@@ -116,7 +149,7 @@ class PostgreSQLDatabase(CommonDatabase):
         FROM "{SONGS_TABLENAME}"
         WHERE "{FIELD_FINGERPRINTED}" = 1;
     """
-
+    
     # DROPS
     DROP_FINGERPRINTS = F'DROP TABLE IF EXISTS "{FINGERPRINTS_TABLENAME}";'
     DROP_SONGS = F'DROP TABLE IF EXISTS "{SONGS_TABLENAME}";'
@@ -147,6 +180,10 @@ class PostgreSQLDatabase(CommonDatabase):
         self._options = options
     
     def ensure_daily_partition(self) -> None:
+        if DAILY_PARTITION:
+            pass
+        else:
+            return
         today = datetime.now().date()
         tomorrow = today + timedelta(days=1)
         part_name = f'{FINGERPRINTS_TABLENAME}_{today.year}_{today.month:02d}_{today.day:02d}'

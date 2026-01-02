@@ -20,7 +20,7 @@ from sdio_dejavu.config.settings import (DEFAULT_FS, DEFAULT_OVERLAP_RATIO,
                                     FINGERPRINTED_HASHES, HASHES_MATCHED,
                                     INPUT_CONFIDENCE, INPUT_HASHES, OFFSET,
                                     OFFSET_SECS, SONG_ID, SONG_NAME, TOPN)
-from sdio_dejavu.logic.fingerprint import fingerprint
+from sdio_dejavu.logic.fingerprint import fingerprint,filter_result
 from loguru import logger
 
 class Dejavu:
@@ -281,10 +281,36 @@ class Dejavu:
         :param Fs: sampling rate which defaults to {DEFAULT_FS}.
         :return: a list of tuples for hash and its corresponding offset, together with the generation time.
         """
-        t = time()
+        t = time.time()
         hashes = fingerprint(samples, Fs=Fs)
-        fingerprint_time = time() - t
+        fingerprint_time = time.time() - t
         return hashes, fingerprint_time
+
+
+    def get_similar_matches_hash64(self, cm_id:str) -> list[dict[str, any]]:
+
+        hashes = self.db.get_fingerprints_by_song_name(cm_id)
+        matches, dedup_hashes, query_time = self.find_matches_hash64(hashes)
+        final_results = self.align_matches(matches, dedup_hashes, len(hashes))
+        
+        return filter_result(final_results)
+    
+    def get_similar_matches_hash64_only_name(self, cm_id:str) -> list[str]:
+
+        hashes = self.db.get_fingerprints_by_song_name(cm_id)
+        matches, dedup_hashes, query_time = self.find_matches_hash64(hashes)
+        final_results = self.align_matches(matches, dedup_hashes, len(hashes))
+        final_results = filter_result(final_results)
+        
+        match_names = []
+
+        for item in final_results:
+            if item["cm_name"] == cm_id:
+                pass
+            else:
+                match_names.append(item["cm_name"])
+
+        return match_names
 
     def find_matches(self, hashes: List[Tuple[str, int]]) -> Tuple[List[Tuple[int, int]], Dict[str, int], float]:
         """
@@ -297,6 +323,22 @@ class Dejavu:
         """
         t = time.time()
         matches, dedup_hashes = self.db.return_matches(hashes)
+        query_time = time.time() - t
+
+        return matches, dedup_hashes, query_time
+    
+
+    def find_matches_hash64(self, hashes: List[Tuple[str ,int , int]]) -> Tuple[List[Tuple[int, int]], Dict[str, int], float]:
+        """
+        Finds the corresponding matches on the fingerprinted audios for the given hashes.
+
+        :param hashes: list of tuples for hashes and their corresponding offsets
+        :return: a tuple containing the matches found against the db, a dictionary which counts the different
+         hashes matched for each song (with the song id as key), and the time that the query took.
+
+        """
+        t = time.time()
+        matches, dedup_hashes = self.db.return_matches_hash64(hashes)
         query_time = time.time() - t
 
         return matches, dedup_hashes, query_time
@@ -348,7 +390,7 @@ class Dejavu:
         start_day = target_day or date.today()
         matched_songs = set()
 
-        hashes = self.get_fingerprints_for_song(song_name)
+        hashes = self.get_fp_cached(song_name)
         if not hashes:
             return []
 
@@ -366,7 +408,7 @@ class Dejavu:
                     continue
             except Exception as e:
                 logger.debug(f"Skip table {table_name}: {e}")
-                continue
+                break
 
             for r in results:
                 if r != song_name: 
@@ -400,6 +442,10 @@ class Dejavu:
             f"fingerprints_{day.strftime('%Y_%m_%d')}"
             for day in days
         ]
+
+    @lru_cache(maxsize=100_000)
+    def get_fp_cached(self,song_name: str):
+        return self.get_fingerprints_for_song(song_name)
 
     @lru_cache(maxsize=1)
     def _get_song_map(self) -> dict[str, dict]:

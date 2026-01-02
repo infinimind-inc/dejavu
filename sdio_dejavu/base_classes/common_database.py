@@ -3,6 +3,11 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 from sdio_dejavu.base_classes.base_database import BaseDatabase
 from loguru import logger
+from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
+                                    FIELD_HASH, FIELD_OFFSET, FIELD_SONG_ID,
+                                    FIELD_SONGNAME, FIELD_TOTAL_HASHES,
+                                    FINGERPRINTS_TABLENAME, SONGS_TABLENAME,DAILY_PARTITION,
+                                    )
 
 class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
     # Since several methods across different databases are actually just the same
@@ -40,9 +45,9 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
     def setup(self) -> None:
         """Safely create tables if missing."""
         with self.cursor() as cur:
-            cur.execute("""
-                SELECT to_regclass('public.songs'),
-                    to_regclass('public.fingerprints');
+            cur.execute(f"""
+                SELECT to_regclass('public.{SONGS_TABLENAME}'),
+                    to_regclass('public.{FINGERPRINTS_TABLENAME}');
             """)
             songs, fps = cur.fetchone()
             if songs and fps:
@@ -50,7 +55,8 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
                 return
             logger.info("Creating fingerprint tables...")
             cur.execute(self.CREATE_SONGS_TABLE)
-            cur.execute(self.CREATE_FINGERPRINTS_TABLE)
+            #cur.execute(self.CREATE_FINGERPRINTS_TABLE)
+            cur.execute(self.CREATE_FINGERPRINTS_TABLE_DEFAULT)
         self.ensure_daily_partition()
     
     def empty(self) -> None:
@@ -124,6 +130,36 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         with self.cursor(dictionary=True) as cur:
             cur.execute(self.SELECT_SONG, (song_id,))
             return cur.fetchone()
+
+    def get_fingerprints_by_song_name(
+        self,
+        cm_id: str
+    ) -> list[Tuple[str, int, int]]:
+        """
+        Fetch fingerprints for a given cm_id.
+
+        Returns:
+            [(hex_hash, hash64, offset), ...]
+        """
+
+        results: list[Tuple[str, int, int]] = []
+
+        with self.cursor() as cur:
+            cur.execute(
+                self.SELECT_FINGERPRINTS_BY_SONG_NAME,
+                (cm_id,)
+            )
+
+            for hash_hex, hash64, offset in cur:
+                # defensive: hash64 must exist
+                if hash64 is None:
+                    continue
+
+                results.append(
+                    (hash_hex, int(hash64), int(offset))
+                )
+
+        return results
 
     def insert(self, fingerprint: str, song_id: int, offset: int):
         """
@@ -240,6 +276,58 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
                         results.extend((sid, db_offset - s_off) for s_off in sample_offsets)
 
             return results, dedup_hashes
+    
+    def return_matches_hash64(
+        self,
+        hashes: List[Tuple[str, int, int]],
+        batch_size: int = 1000
+        ) -> Tuple[List[Tuple[int, int]], Dict[int, int]]:
+
+        """
+        Search DB using hash64 (BIGINT) only.
+
+        Input:
+            hashes: [(hex_hash, hash64, offset), ...]
+        Output:
+            results: [(song_id, offset_diff), ...]
+            dedup_hashes: {song_id: matched_hash_count}
+        """
+
+        # mapper: hash64 -> [offsets]
+        mapper: Dict[int, List[int]] = defaultdict(list)
+        for _, hash64, offset in hashes:
+            mapper[hash64].append(offset)
+
+        values = list(mapper.keys())
+
+        dedup_hashes: Dict[int, int] = defaultdict(int)
+        results: List[Tuple[int, int]] = []
+
+        with self.cursor() as cur:
+            for index in range(0, len(values), batch_size):
+                batch = values[index:index + batch_size]
+
+                placeholders = ', '.join(['%s'] * len(batch))
+                query = self.SELECT_MULTIPLE_INT64 % placeholders
+
+                # IMPORTANT: values are int64, not hex
+                cur.execute(query, batch)
+
+                for hash64, sid, db_offset in cur:
+                    dedup_hashes[sid] += 1
+
+                    sample_offsets = mapper[hash64]
+
+                    if len(sample_offsets) == 1:
+                        results.append((sid, db_offset - sample_offsets[0]))
+                    else:
+                        # vectorized expansion
+                        results.extend(
+                            (sid, db_offset - s_off)
+                            for s_off in sample_offsets
+                        )
+
+        return results, dedup_hashes
 
     def return_matches_by_table(
             self, 
