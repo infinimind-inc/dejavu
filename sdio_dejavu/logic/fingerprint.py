@@ -119,7 +119,7 @@ def get_2D_peaks(arr2D: np.array, plot: bool = False, amp_min: int = DEFAULT_AMP
     return list(zip(freqs_filter, times_filter))
 
 
-def generate_hashes(peaks: List[Tuple[int, int]], fan_value: int = DEFAULT_FAN_VALUE) -> List[Tuple[str, int]]:
+def generate_hashes(peaks: List[Tuple[int, int]], fan_value: int = DEFAULT_FAN_VALUE) -> List[Tuple[str, int, int]]:
     """
     Hash list structure:
        sha1_hash[0:FINGERPRINT_REDUCTION]    time_offset
@@ -150,8 +150,9 @@ def generate_hashes(peaks: List[Tuple[int, int]], fan_value: int = DEFAULT_FAN_V
 
                 if MIN_HASH_TIME_DELTA <= t_delta <= MAX_HASH_TIME_DELTA:
                     h = hashlib.sha1(f"{str(freq1)}|{str(freq2)}|{str(t_delta)}".encode('utf-8'))
-
-                    hashes.append((h.hexdigest()[0:FINGERPRINT_REDUCTION], t1))
+                    hash_tmp = h.hexdigest()[0:FINGERPRINT_REDUCTION]
+                    hash64 = hex2int64(hash_tmp)
+                    hashes.append((hash_tmp,hash64, t1))
 
     return hashes
 

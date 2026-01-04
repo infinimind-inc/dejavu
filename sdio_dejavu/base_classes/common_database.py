@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 from sdio_dejavu.base_classes.base_database import BaseDatabase
 from loguru import logger
+from psycopg2.extras import execute_batch
 from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
                                     FIELD_HASH, FIELD_OFFSET, FIELD_SONG_ID,
                                     FIELD_SONGNAME, FIELD_TOTAL_HASHES,
@@ -55,8 +56,9 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
                 return
             logger.info("Creating fingerprint tables...")
             cur.execute(self.CREATE_SONGS_TABLE)
-            #cur.execute(self.CREATE_FINGERPRINTS_TABLE)
             cur.execute(self.CREATE_FINGERPRINTS_TABLE_DEFAULT)
+            #cur.execute(self.CREATE_FINGERPRINTS_TABLE_INDEX_HASH64)
+            #cur.execute(self.CREATE_FINGERPRINTS_TABLE_INDEX_SONGID)
         self.ensure_daily_partition()
     
     def empty(self) -> None:
@@ -214,7 +216,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         """
         return self.query(None)
 
-    def insert_hashes(self, song_id: int, hashes: List[Tuple[str, int]], batch_size: int = 1000) -> None:
+    def insert_hashes(self, song_id: int, hashes: list[Tuple[str, int,int]], batch_size: int = 1000) -> None:
         """
         Insert a multitude of fingerprints.
 
@@ -225,11 +227,11 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         :param batch_size: insert batches.
         """
         self.ensure_daily_partition()
-        values = [(song_id, hsh, int(offset)) for hsh, offset in hashes]
+        values = [(song_id, hsh, hsh_64,int(offset)) for hsh, hsh_64,offset in hashes]
 
         with self.cursor() as cur:
             for index in range(0, len(hashes), batch_size):
-                cur.executemany(self.INSERT_FINGERPRINT, values[index: index + batch_size])
+                execute_batch(cur,self.INSERT_FINGERPRINT, values[index: index + batch_size],batch_size)
 
     def return_matches(self, hashes: List[Tuple[str, int]],
                        batch_size: int = 1000) -> Tuple[List[Tuple[int, int]], Dict[int, int]]:
