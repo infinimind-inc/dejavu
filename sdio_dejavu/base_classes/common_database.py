@@ -56,7 +56,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
                 return
             logger.info("Creating fingerprint tables...")
             cur.execute(self.CREATE_SONGS_TABLE)
-            cur.execute(self.CREATE_FINGERPRINTS_TABLE_DEFAULT)
+            cur.execute(self.CREATE_FINGERPRINTS_TABLE_SQL)
             #cur.execute(self.CREATE_FINGERPRINTS_TABLE_INDEX_HASH64)
             #cur.execute(self.CREATE_FINGERPRINTS_TABLE_INDEX_SONGID)
         self.ensure_daily_partition()
@@ -136,7 +136,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
     def get_fingerprints_by_song_name(
         self,
         cm_id: str
-    ) -> list[Tuple[str, int, int]]:
+    ) -> list[Tuple[int, int]]:
         """
         Fetch fingerprints for a given cm_id.
 
@@ -152,13 +152,13 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
                 (cm_id,)
             )
 
-            for hash_hex, hash64, offset in cur:
+            for hash64, offset in cur:
                 # defensive: hash64 must exist
                 if hash64 is None:
                     continue
 
                 results.append(
-                    (hash_hex, int(hash64), int(offset))
+                    (int(hash64), int(offset))
                 )
 
         return results
@@ -279,9 +279,37 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
 
             return results, dedup_hashes
     
+    def return_matches_hash64_unnest(
+        self,
+        hashes: list[tuple[int, int]],
+    ) -> tuple[list[tuple[int, int]], dict[int, int]]:
+
+        if not hashes:
+            return [], {}
+
+        hash64_list = []
+        offset_list = []
+
+        for hash64, offset in hashes:
+            hash64_list.append(hash64)
+            offset_list.append(offset)
+
+        results = []
+        dedup_hashes = defaultdict(set)
+
+        with self.cursor() as cur:
+            cur.execute(self.MATCHES_HASH64_UNNEST, (hash64_list, offset_list))
+
+            for song_id, hash64, offset_diff in cur:
+                results.append((song_id, offset_diff))
+                dedup_hashes[song_id].add(hash64)
+        dedup_hashes = {k: len(v) for k, v in dedup_hashes.items()}
+        return results, dedup_hashes
+
+
     def return_matches_hash64(
         self,
-        hashes: List[Tuple[str, int, int]],
+        hashes: List[Tuple[int, int]],
         batch_size: int = 1000
         ) -> Tuple[List[Tuple[int, int]], Dict[int, int]]:
 
@@ -289,7 +317,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         Search DB using hash64 (BIGINT) only.
 
         Input:
-            hashes: [(hex_hash, hash64, offset), ...]
+            hashes: [(hash64, offset), ...]
         Output:
             results: [(song_id, offset_diff), ...]
             dedup_hashes: {song_id: matched_hash_count}
@@ -297,7 +325,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
 
         # mapper: hash64 -> [offsets]
         mapper: Dict[int, List[int]] = defaultdict(list)
-        for _, hash64, offset in hashes:
+        for hash64, offset in hashes:
             mapper[hash64].append(offset)
 
         values = list(mapper.keys())

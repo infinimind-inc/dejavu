@@ -9,9 +9,11 @@ from typing import Dict, List, Tuple
 import numpy as np
 from hashlib import sha1
 import concurrent
+from collections import defaultdict, Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, timedelta
 import sdio_dejavu.logic.decoder as decoder
+from tqdm import tqdm
 from sdio_dejavu.base_classes.base_database import get_database
 from sdio_dejavu.config.settings import (DEFAULT_FS, DEFAULT_OVERLAP_RATIO,
                                     DEFAULT_WINDOW_SIZE, FIELD_FILE_SHA1,
@@ -20,7 +22,7 @@ from sdio_dejavu.config.settings import (DEFAULT_FS, DEFAULT_OVERLAP_RATIO,
                                     FINGERPRINTED_HASHES, HASHES_MATCHED,
                                     INPUT_CONFIDENCE, INPUT_HASHES, OFFSET,
                                     OFFSET_SECS, SONG_ID, SONG_NAME, TOPN)
-from sdio_dejavu.logic.fingerprint import fingerprint,filter_result
+from sdio_dejavu.logic.fingerprint import fingerprint,filter_result,enrich_hash64
 from loguru import logger
 
 class Dejavu:
@@ -71,56 +73,77 @@ class Dejavu:
     def fingerprint_media_list(
         self,
         media_list: list[str],
-        nprocesses: int | None = None   # kept for compatibility but unused
+        nprocesses: int | None = None,
     ):
-        # No parallelism → always sequential
-        failed_files = []
+        """
+        Multiprocess fingerprinting (CPU-bound).
+        DB writes are executed in the parent process only.
+        """
 
-        # Build work items early
+        nprocesses = nprocesses or max(1, min(4, os.cpu_count() or 2))
+        failed_files: list[str] = []
+
         worker_input = [
             (filename, self.limit)
             for filename in media_list
             if decoder.unique_hash(filename) not in self.songhashes_set
         ]
-        logger.info(f"[FP] sequential fingerprinting {len(worker_input)} files")
+
+        total = len(worker_input)
+        if total == 0:
+            logger.info("[FP] no new files to fingerprint")
+            return []
+
+        logger.info(f"[FP] submitting {total} files with {nprocesses} processes")
 
         start_time = time.perf_counter()
-        completed = 0
-        timeout_s = 120  # per-file guard
+        timeout_s = 120
 
-        for filename, limit in worker_input:
-            try:
-                logger.debug(f"[FP] processing: {filename}")
+        submitted: dict[concurrent.futures.Future, str] = {}
 
-                # Run worker directly (no executor)
-                # Wrap inside a timeout using signal (UNIX only)
-                result = Dejavu._fingerprint_worker((filename, limit))
+        with ProcessPoolExecutor(
+            max_workers=nprocesses,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor, tqdm(
+            total=total,
+            desc="[FP] fingerprinting",
+            unit="file",
+            smoothing=0.1,
+        ) as pbar:
 
-                # song_name, hashes, file_hash
-                song_name, hashes, file_hash = result
+            for item in worker_input:
+                filename = item[0]
+                fut = executor.submit(Dejavu._fingerprint_worker, item)
+                submitted[fut] = filename
 
-                # DB operations
-                with self.db.cursor() as cur:
-                    sid = self.db.insert_song(song_name, file_hash, len(hashes))
-                    self.db.insert_hashes(sid, hashes)
-                    self.db.set_song_fingerprinted(sid)
+            for fut in as_completed(submitted):
+                filename = submitted[fut]
+                try:
+                    song_name, hashes, file_hash = fut.result(timeout=timeout_s)
 
-                completed += 1
-                if completed % 50 == 0:
-                    logger.info(
-                        f"[FP] progress: {completed}/{len(worker_input)} "
-                        f"(elapsed {time.perf_counter() - start_time:.1f}s)"
-                    )
+                    with self.db.cursor():
+                        sid = self.db.insert_song(song_name, file_hash, len(hashes))
+                        self.db.insert_hashes(sid, hashes)
+                        self.db.set_song_fingerprinted(sid)
 
-            except Exception as e:
-                logger.exception(f"[FP] failed: {filename} | {e}")
-                failed_files.append(filename)
+                except concurrent.futures.TimeoutError:
+                    logger.error(f"[FP] timeout: {filename}")
+                    failed_files.append(filename)
+
+                except Exception as e:
+                    logger.exception(f"[FP] failed: {filename} | {e}")
+                    failed_files.append(filename)
+
+                finally:
+                    pbar.update(1)
 
         logger.info(
-            f"[FP] done. ok={completed} fail={len(failed_files)} "
-            f"elapsed={time.perf_counter()-start_time:.1f}s"
+            f"[FP] done. ok={total - len(failed_files)} "
+            f"fail={len(failed_files)} "
+            f"elapsed={time.perf_counter() - start_time:.1f}s"
         )
         return failed_files
+
 
 
     def fingerprint_media_list_multiprocess(
@@ -260,7 +283,7 @@ class Dejavu:
         song_name = song_name or song_name_from_path
         # don't refingerprint already fingerprinted files
         if song_hash in self.songhashes_set:
-            print(f"{song_name} already fingerprinted, continuing...")
+            logger.info(f"{song_name} already fingerprinted, continuing...")
         else:
             song_name, hashes, file_hash = Dejavu._fingerprint_worker(
                 file_path,
@@ -283,18 +306,10 @@ class Dejavu:
         """
         t = time.time()
         hashes = fingerprint(samples, Fs=Fs)
+        hashes_int64 = enrich_hash64(hashes)
         fingerprint_time = time.time() - t
-        return hashes, fingerprint_time
+        return hashes_int64, fingerprint_time
 
-
-    def get_similar_matches_hash64(
-            self, cm_id:str) -> list[dict[str, any]]:
-
-        hashes = self.db.get_fingerprints_by_song_name(cm_id)
-        matches, dedup_hashes, query_time = self.find_matches_hash64(hashes)
-        final_results = self.align_matches(matches, dedup_hashes, len(hashes))
-        
-        return filter_result(final_results)
     
     def parse_duration(self, cm_id: str) -> int:
         """
@@ -315,12 +330,13 @@ class Dejavu:
             self, 
             cm_id:str,
             threshold:float = 0.3,
+            use_unnest:bool = False,
             ) -> list[str]:
 
         duration = self.parse_duration(cm_id)
         hashes = self.db.get_fingerprints_by_song_name(cm_id)
-        matches, dedup_hashes, _ = self.find_matches_hash64(hashes)
-        final_results = self.align_matches(matches, dedup_hashes, len(hashes),confidence_threshold=threshold)
+        matches, dedup_hashes, _ = self.find_matches_hash64(hashes,use_unnest)
+        final_results = self.align_matches(matches, dedup_hashes, len(hashes),confidence_threshold=threshold,use_unnest=use_unnest)
         final_results = filter_result(final_results)
         
         match_names = []
@@ -353,7 +369,11 @@ class Dejavu:
         return matches, dedup_hashes, query_time
     
 
-    def find_matches_hash64(self, hashes: List[Tuple[str ,int , int]]) -> Tuple[List[Tuple[int, int]], Dict[str, int], float]:
+    def find_matches_hash64(
+            self, 
+            hashes: list[Tuple[int , int]],
+            use_unnest:bool = False,
+        ) -> Tuple[list[Tuple[int, int]], dict[str, int], float]:
         """
         Finds the corresponding matches on the fingerprinted audios for the given hashes.
 
@@ -363,83 +383,15 @@ class Dejavu:
 
         """
         t = time.time()
-        matches, dedup_hashes = self.db.return_matches_hash64(hashes)
+        matches = []
+        dedup_hashes = {}
+        if use_unnest:
+            matches, dedup_hashes = self.db.return_matches_hash64_unnest(hashes)
+        else:
+            matches, dedup_hashes = self.db.return_matches_hash64(hashes)
         query_time = time.time() - t
 
         return matches, dedup_hashes, query_time
-
-    def find_matches_by_table(self, hashes: List[Tuple[str, int]],table_name:str) -> Tuple[List[Tuple[int, int]], Dict[str, int], float]:
-        """
-        Finds the corresponding matches on the fingerprinted audios for the given hashes.
-
-        :param hashes: list of tuples for hashes and their corresponding offsets
-        :return: a tuple containing the matches found against the db, a dictionary which counts the different
-         hashes matched for each song (with the song id as key), and the time that the query took.
-
-        """
-        t = time.time()
-        matches, dedup_hashes = self.db.return_matches_by_table(hashes,table_name)
-        query_time = time.time() - t
-
-        return matches, dedup_hashes, query_time
-
-    def find_similar_ads_by_hashes(
-        self,
-        hashes: list[tuple[str, int]],
-        table_name: str,
-        confidence_threshold=0.1,
-    ) -> list[str]:
-        if not hashes:
-            return []
-
-        matches, dedup_hashes, _ = self.find_matches_by_table(hashes, table_name)
-
-        results = self.align_matches(
-            matches,
-            dedup_hashes,
-            queried_hashes=len(hashes),
-            confidence_threshold=confidence_threshold,
-        )
-
-        return [res[SONG_NAME].decode("utf8") for res in results]
-
-
-    def find_similar_ads_by_days(
-        self,
-        song_name: str,
-        days: int,
-        threshold: float = 0.1,
-        target_day: date | None = None,
-    ) -> list[str]:
-
-        start_day = target_day or date.today()
-        matched_songs = set()
-
-        hashes = self.get_fp_cached(song_name)
-        if not hashes:
-            return []
-
-        for i in range(days):
-            d = start_day - timedelta(days=i)
-            table_name = f"fingerprints_{d.strftime('%Y_%m_%d')}"
-
-            try:
-                results = self.find_similar_ads_by_hashes(
-                    hashes=hashes,
-                    table_name=table_name,
-                    confidence_threshold=threshold,
-                )
-                if not results:
-                    continue
-            except Exception as e:
-                logger.debug(f"Skip table {table_name}: {e}")
-                break
-
-            for r in results:
-                if r != song_name: 
-                    matched_songs.add(r)
-
-        return sorted(matched_songs)
 
     def _parse_day_from_song_name(self,song_name: str) -> date | None:
         """
@@ -494,31 +446,102 @@ class Dejavu:
         """Call this if songs table is updated."""
         self._get_song_map.cache_clear()
 
-    def get_fingerprints_by_songs(self, song_names: list[str]):
-        with self.db.cursor(dictionary=True) as cur:
-            cur.execute(
-                f'''
-                SELECT s.song_name,
-                    upper(encode(f."hash",'hex')) AS hash,
-                    f."offset"
-                FROM fingerprints f
-                JOIN songs s ON f.song_id = s.song_id
-                WHERE s.song_name = ANY(%s)
-                ''',
-                (song_names,)
+    def align_matches_unnest(
+        self,
+        matches: list[tuple[int, int]],
+        dedup_hashes: dict[int, int],
+        queried_hashes: int,
+        topn: int = TOPN,
+        confidence_threshold: float = 0.05,
+    ) -> list[dict]:
+
+        # ----------------------------------------
+        # 1.song_id -> Counter(offset_diff)
+        # ----------------------------------------
+        offset_votes: dict[int, Counter] = defaultdict(Counter)
+
+        for song_id, offset_diff in matches:
+            offset_votes[song_id][offset_diff] += 1
+
+        # ----------------------------------------
+        # 2. 对每个 song，取票数最多的 offset
+        # ----------------------------------------
+        song_best = []  # (song_id, best_offset, vote_count)
+
+        for song_id, counter in offset_votes.items():
+            best_offset, vote_count = counter.most_common(1)[0]
+            song_best.append((song_id, best_offset, vote_count))
+
+        # ----------------------------------------
+        # 3. 按 vote_count 排序，提前截断 topn
+        # ----------------------------------------
+        song_best.sort(key=lambda x: x[2], reverse=True)
+        if topn:
+            song_best = song_best[:topn]
+
+        # ----------------------------------------
+        # 4. 只加载需要的 song metadata
+        # ----------------------------------------
+        """
+        song_ids = [sid for sid, _, _ in song_best]
+        songs_meta = {
+            s[SONG_ID]: s
+            for s in self.db.get_songs_by_ids(song_ids)
+        }
+        """
+        songs_meta = {s[SONG_ID]: s for s in self.db.get_songs()}
+
+        # ----------------------------------------
+        # 5. 组装最终结果 + confidence 过滤
+        # ----------------------------------------
+        results = []
+
+        for song_id, offset, _ in song_best:
+            song = songs_meta.get(song_id)
+            if not song:
+                continue
+
+            song_hashes = song.get(FIELD_TOTAL_HASHES)
+            if not song_hashes:
+                continue
+
+            hashes_matched = dedup_hashes.get(song_id, 0)
+            fingerprinted_conf = hashes_matched / song_hashes
+
+            if fingerprinted_conf < confidence_threshold:
+                continue
+
+            nseconds = round(
+                float(offset) / DEFAULT_FS
+                * DEFAULT_WINDOW_SIZE
+                * DEFAULT_OVERLAP_RATIO,
+                5
             )
-            rows = cur.fetchall()
 
-        fp_map = {}
-        for r in rows:
-            fp_map.setdefault(r["song_name"], []).append(
-                (r["hash"], r["offset"])
-            )
-        return fp_map
+            results.append({
+                SONG_ID: song_id,
+                SONG_NAME: song.get(SONG_NAME).encode("utf8"),
+                INPUT_HASHES: queried_hashes,
+                FINGERPRINTED_HASHES: song_hashes,
+                HASHES_MATCHED: hashes_matched,
+                INPUT_CONFIDENCE: round(hashes_matched / queried_hashes, 2),
+                FINGERPRINTED_CONFIDENCE: round(fingerprinted_conf, 2),
+                OFFSET: offset,
+                OFFSET_SECS: nseconds,
+                FIELD_FILE_SHA1: song.get(FIELD_FILE_SHA1).encode("utf8"),
+            })
+
+        return results
 
 
-    def align_matches(self, matches: list[Tuple[int, int]], dedup_hashes: dict[str, int], queried_hashes: int,
-                      topn: int = TOPN,confidence_threshold:float = 0.05) -> list[Dict[str, any]]:
+    def align_matches_hash64(
+            self, 
+            matches: list[Tuple[int, int]], 
+            dedup_hashes: dict[str, int], 
+            queried_hashes: int,
+            topn: int = TOPN,
+            confidence_threshold:float = 0.05
+        ) -> list[dict[str, any]]:
         """
         Finds hash matches that align in time with other matches and finds
         consensus about which hashes are "true" signal from the audio.
@@ -575,6 +598,21 @@ class Dejavu:
 
         return songs_result
 
+    def align_matches(
+            self, 
+            matches: list[Tuple[int, int]], 
+            dedup_hashes: dict[str, int], 
+            queried_hashes: int,
+            topn: int = TOPN,
+            confidence_threshold:float = 0.05,
+            use_unnest:bool = False,
+        ) -> list[dict[str, any]]:
+
+        if use_unnest:
+            return self.align_matches_unnest(matches,dedup_hashes,queried_hashes,topn,confidence_threshold)
+        else:
+            return self.align_matches_hash64(matches,dedup_hashes,queried_hashes,topn,confidence_threshold)
+
     def recognize(self, recognizer, *options, **kwoptions) -> Dict[str, any]:
         r = recognizer(self)
         return r.recognize(*options, **kwoptions)
@@ -590,7 +628,7 @@ class Dejavu:
 
         song_name, extension = os.path.splitext(os.path.basename(file_name))
 
-        fingerprints, file_hash = Dejavu.get_file_fingerprints(file_name, limit, print_output=True)
+        fingerprints, file_hash = Dejavu.get_file_fingerprints(file_name, limit, print_output=False)
 
         return song_name, fingerprints, file_hash
 
@@ -604,13 +642,14 @@ class Dejavu:
                 print(f"Fingerprinting channel {channeln}/{channel_amount} for {file_name}")
 
             hashes = fingerprint(channel, Fs=fs)
+            #hashes_int64 = enrich_hash64(hashes)
 
             if print_output:
                 print(f"Finished channel {channeln}/{channel_amount} for {file_name}")
 
             fingerprints |= set(hashes)
 
-        return fingerprints, file_hash
+        return hashes, file_hash
     
     @staticmethod
     def get_np_fingerprints(
