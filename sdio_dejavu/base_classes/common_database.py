@@ -52,7 +52,8 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
             """)
             songs, fps = cur.fetchone()
             if songs and fps:
-                logger.info("Fingerprint tables already exist — skipping DDL.")
+                logger.info(f"Fingerprint tables {SONGS_TABLENAME} already exist — skipping DDL.")
+                logger.info(f"Fingerprint tables {FINGERPRINTS_TABLENAME} already exist — skipping DDL.")
                 return
             logger.info("Creating fingerprint tables...")
             cur.execute(self.CREATE_SONGS_TABLE)
@@ -120,6 +121,14 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         """
         with self.cursor(dictionary=True) as cur:
             cur.execute(self.SELECT_SONGS)
+            return list(cur)
+    
+    def get_songs_by_ids(self, song_ids: List[int]) -> List[Dict]:
+        if not song_ids: return []
+        format_strings = ','.join(['%s'] * len(song_ids))
+        query = self.SELECT_SONGS_BY_IDS + f" WHERE {FIELD_SONG_ID} IN ({format_strings})"
+        with self.cursor(dictionary=True) as cur:
+            cur.execute(query, song_ids)
             return list(cur)
 
     def get_song_by_id(self, song_id: int) -> Dict[str, str]:
@@ -309,53 +318,40 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
 
     def return_matches_hash64(
         self,
-        hashes: List[Tuple[int, int]],
+        hashes: list[Tuple[int, int]],
         batch_size: int = 1000
-        ) -> Tuple[List[Tuple[int, int]], Dict[int, int]]:
-
-        """
-        Search DB using hash64 (BIGINT) only.
-
-        Input:
-            hashes: [(hash64, offset), ...]
-        Output:
-            results: [(song_id, offset_diff), ...]
-            dedup_hashes: {song_id: matched_hash_count}
-        """
-
-        # mapper: hash64 -> [offsets]
+    ) -> Tuple[list[Tuple[int, int]], dict[int, int]]:
+        
+        # 1. 预处理：hash64 -> offsets
         mapper: Dict[int, List[int]] = defaultdict(list)
         for hash64, offset in hashes:
             mapper[hash64].append(offset)
 
         values = list(mapper.keys())
-
         dedup_hashes: Dict[int, int] = defaultdict(int)
         results: List[Tuple[int, int]] = []
 
         with self.cursor() as cur:
             for index in range(0, len(values), batch_size):
                 batch = values[index:index + batch_size]
-
                 placeholders = ', '.join(['%s'] * len(batch))
                 query = self.SELECT_MULTIPLE_INT64 % placeholders
 
-                # IMPORTANT: values are int64, not hex
                 cur.execute(query, batch)
-
-                for hash64, sid, db_offset in cur:
+                
+                # --- 优化点：使用 fetchall 减少游标通信开销 ---
+                rows = cur.fetchall() 
+                
+                for hash64, sid, db_offset in rows:
                     dedup_hashes[sid] += 1
-
+                    
+                    # --- 优化点：直接利用本地变量引用，减少查找开销 ---
                     sample_offsets = mapper[hash64]
-
-                    if len(sample_offsets) == 1:
-                        results.append((sid, db_offset - sample_offsets[0]))
-                    else:
-                        # vectorized expansion
-                        results.extend(
-                            (sid, db_offset - s_off)
-                            for s_off in sample_offsets
-                        )
+                    
+                    # 避免使用 extend + 生成器，对于 10 万量级，
+                    # 简单的列表推导或直接 append 在某些 Python 版本下更稳
+                    for s_off in sample_offsets:
+                        results.append((sid, db_offset - s_off))
 
         return results, dedup_hashes
 

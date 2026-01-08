@@ -15,6 +15,7 @@ from datetime import date, timedelta
 import sdio_dejavu.logic.decoder as decoder
 from tqdm import tqdm
 from sdio_dejavu.base_classes.base_database import get_database
+import time
 from sdio_dejavu.config.settings import (DEFAULT_FS, DEFAULT_OVERLAP_RATIO,
                                     DEFAULT_WINDOW_SIZE, FIELD_FILE_SHA1,
                                     FIELD_TOTAL_HASHES,
@@ -326,13 +327,16 @@ class Dejavu:
         r = min(d1, d2) / max(d1, d2)
         return min_ratio <= r <= max_ratio
 
+    """
     def get_similar_cm_ids_hash64(
             self, 
             cm_id:str,
             threshold:float = 0.3,
             use_unnest:bool = False,
+            verbose:bool = False,
             ) -> list[str]:
-
+        
+        time = time.ti
         duration = self.parse_duration(cm_id)
         hashes = self.db.get_fingerprints_by_song_name(cm_id)
         matches, dedup_hashes, _ = self.find_matches_hash64(hashes,use_unnest)
@@ -351,6 +355,60 @@ class Dejavu:
             if self.is_duration_compatible(duration, duration_other):
                 match_names.append(other)
 
+        return match_names
+        """
+    
+    def get_similar_cm_ids_hash64(
+            self, 
+            cm_id: str,
+            threshold: float = 0.3,
+            use_unnest: bool = False,
+            verbose: bool = False,
+            ) -> list[str]:
+        
+        metrics = {}
+        
+        start = time.time()
+        duration = self.parse_duration(cm_id)
+        metrics["parse_origin_duration"] = time.time() - start
+        
+        t_now = time.time()
+        hashes = self.db.get_fingerprints_by_song_name(cm_id)
+        metrics["get_fingerprints"] = time.time() - t_now
+        
+        t_now = time.time()
+        matches, dedup_hashes, _ = self.find_matches_hash64(hashes, use_unnest)
+        metrics["find_matches"] = time.time() - t_now
+        
+        t_now = time.time()
+        final_results = self.align_matches(
+            matches, 
+            dedup_hashes, 
+            len(hashes), 
+            confidence_threshold=threshold, 
+            use_unnest=use_unnest,
+            verbose=verbose,
+        )
+        metrics["align_matches"] = time.time() - t_now
+        
+        t_now = time.time()
+        final_results = filter_result(final_results)
+        
+        match_names = []
+        for item in final_results:
+            other = item["cm_name"]
+            if other == cm_id:
+                continue
+
+            duration_other = self.parse_duration(other)
+            if self.is_duration_compatible(duration, duration_other):
+                match_names.append(other)
+        metrics["post_process_filter"] = time.time() - t_now
+        
+        if verbose:
+            log_msg = " | ".join([f"{k}: {v:.3f}s" for k, v in metrics.items()])
+            logger.debug(f"Performance Metrics: {log_msg}")
+            
         return match_names
 
     def find_matches(self, hashes: List[Tuple[str, int]]) -> Tuple[List[Tuple[int, int]], Dict[str, int], float]:
@@ -469,7 +527,10 @@ class Dejavu:
         song_best = []  # (song_id, best_offset, vote_count)
 
         for song_id, counter in offset_votes.items():
-            best_offset, vote_count = counter.most_common(1)[0]
+            best_offset, vote_count = max(
+                counter.items(),
+                key=lambda x: (x[1], -abs(x[0]))
+            )
             song_best.append((song_id, best_offset, vote_count))
 
         # ----------------------------------------
@@ -564,21 +625,21 @@ class Dejavu:
         songs_result = []
         #print(f"total {len(songs_matches)} songs matches found")
         # Preload all songs into a dictionary
-        all_songs = {s[SONG_ID]: s for s in self.db.get_songs()}
+        candidate_song_ids = [s[0] for s in songs_matches]
+        songs_meta = {s[SONG_ID]: s for s in self.db.get_songs_by_ids(candidate_song_ids)}
 
         for song_id, offset, _ in songs_matches:  # consider topn elements in the result
-            song = all_songs.get(song_id)
+            song = songs_meta[song_id]
             if not song:
                 continue
             song_name = song.get(SONG_NAME, None)
             song_hashes = song.get(FIELD_TOTAL_HASHES, None)
-            nseconds = round(float(offset) / DEFAULT_FS * DEFAULT_WINDOW_SIZE * DEFAULT_OVERLAP_RATIO, 5)
             hashes_matched = dedup_hashes[song_id]
             fingerprinted_confidence = round(hashes_matched / song_hashes, 2)
             
             if fingerprinted_confidence < confidence_threshold:
                 continue
-
+            nseconds = round(float(offset) / DEFAULT_FS * DEFAULT_WINDOW_SIZE * DEFAULT_OVERLAP_RATIO, 5)
             song = {
                 SONG_ID: song_id,
                 SONG_NAME: song_name.encode("utf8"),
@@ -596,6 +657,9 @@ class Dejavu:
 
             songs_result.append(song)
 
+            if topn and len(songs_result) >= topn:
+                break
+
         return songs_result
 
     def align_matches(
@@ -606,12 +670,35 @@ class Dejavu:
             topn: int = TOPN,
             confidence_threshold:float = 0.05,
             use_unnest:bool = False,
+            verbose:bool = False,
         ) -> list[dict[str, any]]:
 
+        if verbose:
+            song_ids = [m[0] for m in matches]
+            unique_songs = len(set(song_ids))
+            total_matches = len(matches)
+            
+            top_3_songs = Counter(song_ids).most_common(3)
+            
+            logger.debug(
+                f"\n[Align Analysis]\n"
+                f"- Input Queried Hashes: {queried_hashes}\n"
+                f"- Total Matches (N): {total_matches}\n"
+                f"- Unique Songs: {unique_songs}\n"
+                f"- Avg Matches per Song: {total_matches/unique_songs:.2f}\n"
+                f"- Top 3 Match Heavy Songs: {top_3_songs}\n"
+                f"- Use Unnest Mode: {use_unnest}"
+            )
+
+        counts = Counter(m[0] for m in matches)
+        valid_song_ids = {s_id for s_id, count in counts.items() if count > 5}
+        filtered_matches = [m for m in matches if m[0] in valid_song_ids]
+        if verbose:
+            logger.debug(f"- Filtered_matches {len(filtered_matches)}")
         if use_unnest:
-            return self.align_matches_unnest(matches,dedup_hashes,queried_hashes,topn,confidence_threshold)
+            return self.align_matches_unnest(filtered_matches,dedup_hashes,queried_hashes,topn,confidence_threshold)
         else:
-            return self.align_matches_hash64(matches,dedup_hashes,queried_hashes,topn,confidence_threshold)
+            return self.align_matches_hash64(filtered_matches,dedup_hashes,queried_hashes,topn,confidence_threshold)
 
     def recognize(self, recognizer, *options, **kwoptions) -> Dict[str, any]:
         r = recognizer(self)
@@ -642,7 +729,6 @@ class Dejavu:
                 print(f"Fingerprinting channel {channeln}/{channel_amount} for {file_name}")
 
             hashes = fingerprint(channel, Fs=fs)
-            #hashes_int64 = enrich_hash64(hashes)
 
             if print_output:
                 print(f"Finished channel {channeln}/{channel_amount} for {file_name}")

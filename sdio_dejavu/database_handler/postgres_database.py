@@ -185,6 +185,16 @@ class PostgreSQLDatabase(CommonDatabase):
         FROM "{SONGS_TABLENAME}"
         WHERE "{FIELD_FINGERPRINTED}" = 1;
     """
+
+    SELECT_SONGS_BY_IDS = f"""
+        SELECT
+            "{FIELD_SONG_ID}"
+        ,   "{FIELD_SONGNAME}"
+        ,   upper(encode("{FIELD_FILE_SHA1}", 'hex')) AS "{FIELD_FILE_SHA1}"
+        ,   "{FIELD_TOTAL_HASHES}"
+        ,   "date_created"
+        FROM "{SONGS_TABLENAME}" 
+    """
     
     # DROPS
     DROP_FINGERPRINTS = F'DROP TABLE IF EXISTS "{FINGERPRINTS_TABLENAME}";'

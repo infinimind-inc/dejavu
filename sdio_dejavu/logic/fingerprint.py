@@ -23,7 +23,7 @@ def fingerprint(channel_samples: List[int],
                 wsize: int = DEFAULT_WINDOW_SIZE,
                 wratio: float = DEFAULT_OVERLAP_RATIO,
                 fan_value: int = DEFAULT_FAN_VALUE,
-                amp_min: int = DEFAULT_AMP_MIN) -> List[Tuple[str, int]]:
+                amp_min: int = DEFAULT_AMP_MIN) -> List[Tuple[str,int, int]]:
     """
     FFT the channel, log transform output, find local maxima, then return locally sensitive hashes.
 
