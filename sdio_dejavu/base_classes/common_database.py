@@ -4,10 +4,13 @@ from collections import defaultdict
 from sdio_dejavu.base_classes.base_database import BaseDatabase
 from loguru import logger
 from psycopg2.extras import execute_batch
+import time
+from functools import lru_cache
 from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
                                     FIELD_HASH, FIELD_OFFSET, FIELD_SONG_ID,
                                     FIELD_SONGNAME, FIELD_TOTAL_HASHES,
                                     FINGERPRINTS_TABLENAME, SONGS_TABLENAME,DAILY_PARTITION,
+                                    BLACKLISTED_HASH64_COUNT,
                                     )
 
 class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
@@ -91,6 +94,33 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
             count = cur.fetchone()[0] if cur.rowcount != 0 else 0
 
         return count
+
+    @lru_cache(maxsize=1)
+    def _get_blacklisted_hashes(
+        self, 
+        threshold: int = BLACKLISTED_HASH64_COUNT,
+    ) -> set[int]:
+        """
+        缓存高频哈希黑名单。
+        这些哈希在数据库中对应过多的 song_id，会导致查询 IO 爆炸且无实际辨识度。
+        
+        Args:
+            threshold: 频率阈值，count 超过此值的 hash 将被过滤。
+            
+        Returns:
+            set: 包含所有垃圾 hash64 的集合，O(1) 查询效率。
+        """
+        # 这里的查询要针对你的单列索引优化
+
+        with self.cursor() as cur:
+            logger.info(f"Loading blacklisted hashes (threshold > {threshold})...")
+            cur.execute(self.SELECT_BLACKLISTED_HASHED, (threshold,))
+            # fetchall 返回的是 list[tuple]，转换成 set 加速后续对比
+            rows = cur.fetchall()
+            blacklist = {row[0] for row in rows}
+            
+        logger.info(f"Blacklist loaded: {len(blacklist)} noisy hashes filtered.")
+        return blacklist
 
     def get_num_fingerprints(self) -> int:
         """
@@ -291,6 +321,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
     def return_matches_hash64_unnest(
         self,
         hashes: list[tuple[int, int]],
+        verbose:bool = False,
     ) -> tuple[list[tuple[int, int]], dict[int, int]]:
 
         if not hashes:
@@ -304,32 +335,44 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
             offset_list.append(offset)
 
         results = []
-        dedup_hashes = defaultdict(set)
+        dedup_hashes = defaultdict(int)
 
         with self.cursor() as cur:
             cur.execute(self.MATCHES_HASH64_UNNEST, (hash64_list, offset_list))
 
             for song_id, hash64, offset_diff in cur:
                 results.append((song_id, offset_diff))
-                dedup_hashes[song_id].add(hash64)
-        dedup_hashes = {k: len(v) for k, v in dedup_hashes.items()}
+                dedup_hashes[song_id] += 1
         return results, dedup_hashes
 
 
     def return_matches_hash64(
-        self,
-        hashes: list[Tuple[int, int]],
-        batch_size: int = 1000
-    ) -> Tuple[list[Tuple[int, int]], dict[int, int]]:
-        
-        # 1. 预处理：hash64 -> offsets
-        mapper: Dict[int, List[int]] = defaultdict(list)
+            self, 
+            hashes: list[Tuple[int, int]], 
+            batch_size: int = 5000,
+            verbose:bool = False,
+        ) -> tuple[list[tuple[int, int]], dict[int, int]]:
+        t_start = time.perf_counter()
+        blacklisted = self._get_blacklisted_hashes()
+        blocked = 0
+        # 1. 预处理
+        mapper = defaultdict(list)
         for hash64, offset in hashes:
-            mapper[hash64].append(offset)
-
+            if hash64 not in blacklisted:
+                mapper[hash64].append(offset)
+            else:
+                blocked+=1
         values = list(mapper.keys())
-        dedup_hashes: Dict[int, int] = defaultdict(int)
-        results: List[Tuple[int, int]] = []
+        
+        t_preprocessed = time.perf_counter()
+        
+        dedup_hashes = defaultdict(int)
+        results = []
+        
+        total_sql_time = 0
+        total_fetch_time = 0
+        total_post_time = 0
+        total_rows = 0
 
         with self.cursor() as cur:
             for index in range(0, len(values), batch_size):
@@ -337,21 +380,41 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
                 placeholders = ', '.join(['%s'] * len(batch))
                 query = self.SELECT_MULTIPLE_INT64 % placeholders
 
+                # 测量 SQL 执行（发送到接收响应）
+                t1 = time.perf_counter()
                 cur.execute(query, batch)
+                t2 = time.perf_counter()
+                total_sql_time += (t2 - t1)
+
+                # 测量数据抓取（内存反序列化）
+                rows = cur.fetchall()
+                t3 = time.perf_counter()
+                total_fetch_time += (t3 - t2)
                 
-                # --- 优化点：使用 fetchall 减少游标通信开销 ---
-                rows = cur.fetchall() 
-                
+                total_rows += len(rows)
+
+                # 测量业务计算
                 for hash64, sid, db_offset in rows:
                     dedup_hashes[sid] += 1
-                    
-                    # --- 优化点：直接利用本地变量引用，减少查找开销 ---
                     sample_offsets = mapper[hash64]
-                    
-                    # 避免使用 extend + 生成器，对于 10 万量级，
-                    # 简单的列表推导或直接 append 在某些 Python 版本下更稳
                     for s_off in sample_offsets:
                         results.append((sid, db_offset - s_off))
+                t4 = time.perf_counter()
+                total_post_time += (t4 - t3)
+
+        t_end = time.perf_counter()
+
+        if verbose:
+            logger.info(f"--- Performance Report ---")
+            logger.info(f"Input Hashes: {len(hashes)} | Unique Hashes: {len(values)}")
+            logger.info(f"Blocked Hashes: {blocked} | Unique Hashes: {len(values)}")
+            logger.info(f"Total Rows Found: {total_rows} | Result Size: {len(results)}")
+            logger.info(f"Total Time: {t_end - t_start:.4f}s")
+            logger.info(f"  - Preprocessing: {t_preprocessed - t_start:.4f}s")
+            logger.info(f"  - DB Execute (Pure SQL): {total_sql_time:.4f}s")
+            logger.info(f"  - DB Fetch (Serialization): {total_fetch_time:.4f}s")
+            logger.info(f"  - Post-processing (Python Loop): {total_post_time:.4f}s")
+            logger.info(f"--------------------------")
 
         return results, dedup_hashes
 

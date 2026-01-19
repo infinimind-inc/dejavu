@@ -22,7 +22,7 @@ from sdio_dejavu.config.settings import (DEFAULT_FS, DEFAULT_OVERLAP_RATIO,
                                     FINGERPRINTED_CONFIDENCE,
                                     FINGERPRINTED_HASHES, HASHES_MATCHED,
                                     INPUT_CONFIDENCE, INPUT_HASHES, OFFSET,
-                                    OFFSET_SECS, SONG_ID, SONG_NAME, TOPN)
+                                    OFFSET_SECS, SONG_ID, SONG_NAME, TOPN,SONGS_TABLENAME)
 from sdio_dejavu.logic.fingerprint import fingerprint,filter_result,enrich_hash64
 from loguru import logger
 
@@ -377,7 +377,7 @@ class Dejavu:
         metrics["get_fingerprints"] = time.time() - t_now
         
         t_now = time.time()
-        matches, dedup_hashes, _ = self.find_matches_hash64(hashes, use_unnest)
+        matches, dedup_hashes, _ = self.find_matches_hash64(hashes, use_unnest,verbose)
         metrics["find_matches"] = time.time() - t_now
         
         t_now = time.time()
@@ -386,7 +386,7 @@ class Dejavu:
             dedup_hashes, 
             len(hashes), 
             confidence_threshold=threshold, 
-            use_unnest=use_unnest,
+            use_unnest=False,
             verbose=verbose,
         )
         metrics["align_matches"] = time.time() - t_now
@@ -431,6 +431,7 @@ class Dejavu:
             self, 
             hashes: list[Tuple[int , int]],
             use_unnest:bool = False,
+            verbose:bool = False,
         ) -> Tuple[list[Tuple[int, int]], dict[str, int], float]:
         """
         Finds the corresponding matches on the fingerprinted audios for the given hashes.
@@ -444,9 +445,9 @@ class Dejavu:
         matches = []
         dedup_hashes = {}
         if use_unnest:
-            matches, dedup_hashes = self.db.return_matches_hash64_unnest(hashes)
+            matches, dedup_hashes = self.db.return_matches_hash64_unnest(hashes,verbose = verbose)
         else:
-            matches, dedup_hashes = self.db.return_matches_hash64(hashes)
+            matches, dedup_hashes = self.db.return_matches_hash64(hashes,verbose = verbose)
         query_time = time.time() - t
 
         return matches, dedup_hashes, query_time
@@ -479,7 +480,28 @@ class Dejavu:
         ]
 
     @lru_cache(maxsize=1)
-    def _get_song_map(self) -> dict[str, dict]:
+    def _get_song_map_int(self) -> dict[int, dict]:
+        query = f'SELECT * FROM {SONGS_TABLENAME} WHERE fingerprinted = 1;'
+        # 强制使用传统的迭代方式，触发驱动的类型转换逻辑
+        with self.db.cursor(dictionary=True) as cur:
+            cur.execute(query)
+            # 模仿以前“没问题”的做法：迭代游标而非 fetchall
+            rows = [dict(row) for row in cur] 
+
+        processed_map = {}
+        for row in rows:
+            # 二次保险：如果还是 memoryview，手动转 str
+            name = row[SONG_NAME]
+            if hasattr(name, "tobytes"):
+                row[SONG_NAME] = name.tobytes().decode("utf-8")
+            
+            # 存入 map
+            processed_map[row[SONG_ID]] = row
+            
+        return processed_map
+
+    @lru_cache(maxsize=1)
+    def _get_song_map_name_str(self) -> dict[str, dict]:
         """
         Cache song_name -> song row mapping.
 
@@ -492,17 +514,19 @@ class Dejavu:
               }
             }
         """
+        query = f'SELECT * FROM {SONGS_TABLENAME}  WHERE fingerprinted = 1 ;'
         with self.db.cursor(dictionary=True) as cur:
             cur.execute(
-                'SELECT * FROM songs;'
+                query
             )
             rows = cur.fetchall()
 
-        return {row["song_name"]: row for row in rows}
+        return {row[SONG_NAME]: row for row in rows}
 
     def refresh_song_map(self) -> None:
         """Call this if songs table is updated."""
-        self._get_song_map.cache_clear()
+        self._get_song_map_name_str.cache_clear()
+        self._get_song_map_int.cache_clear()
 
     def align_matches_unnest(
         self,
@@ -595,68 +619,71 @@ class Dejavu:
         return results
 
 
-    def align_matches_hash64(
-            self, 
-            matches: list[Tuple[int, int]], 
-            dedup_hashes: dict[str, int], 
-            queried_hashes: int,
-            topn: int = TOPN,
-            confidence_threshold:float = 0.05
-        ) -> list[dict[str, any]]:
+    def align_matches_hash64(self, matches, dedup_hashes, queried_hashes, topn=TOPN, confidence_threshold=0.05):
         """
-        Finds hash matches that align in time with other matches and finds
-        consensus about which hashes are "true" signal from the audio.
-
-        :param matches: matches from the database
-        :param dedup_hashes: dictionary containing the hashes matched without duplicates for each song
-        (key is the song id).
-        :param queried_hashes: amount of hashes sent for matching against the db
-        :param topn: number of results being returned back.
-        :return: a list of dictionaries (based on topn) with match information.
+        Finds hash matches that align in time and consensus using in-memory metadata.
         """
-        # count offset occurrences per song and keep only the maximum ones.
-        sorted_matches = sorted(matches, key=lambda m: (m[0], m[1]))
-        counts = [(*key, len(list(group))) for key, group in groupby(sorted_matches, key=lambda m: (m[0], m[1]))]
-        songs_matches = sorted(
-            [max(list(group), key=lambda g: g[2]) for key, group in groupby(counts, key=lambda count: count[0])],
-            key=lambda count: count[2], reverse=True
-        )
-
         songs_result = []
-        #print(f"total {len(songs_matches)} songs matches found")
-        # Preload all songs into a dictionary
-        candidate_song_ids = [s[0] for s in songs_matches]
-        songs_meta = {s[SONG_ID]: s for s in self.db.get_songs_by_ids(candidate_song_ids)}
+        
+        # Get pre-loaded song metadata from cache (O(1) access)
+        # Note: Ensure _get_song_map returns {song_id: row} for this lookup
+        all_songs_cache = self._get_song_map_int() 
 
-        for song_id, offset, _ in songs_matches:  # consider topn elements in the result
-            song = songs_meta[song_id]
+        # 1. Aggregate matches by song and relative offset (O(N))
+        # match_counts structure: {song_id: {diff_offset: count}}
+        match_counts = defaultdict(lambda: defaultdict(int))
+        for song_id, diff_offset in matches:
+            match_counts[song_id][diff_offset] += 1
+
+        # 2. Find the strongest alignment (consensus) for each song
+        songs_matches = []
+        for song_id, offsets in match_counts.items():
+            # Find the offset with the highest occurrence for this specific song
+            best_offset = max(offsets, key=offsets.get)
+            max_count = offsets[best_offset]
+            songs_matches.append((song_id, best_offset, max_count))
+
+        # 3. Sort candidates by match strength (highest count first)
+        songs_matches.sort(key=lambda x: x[2], reverse=True)
+
+        # 4. Build results using in-memory cache (Eliminating DB Roundtrips)
+        for song_id, offset, _ in songs_matches:
+            # Retrieve metadata from memory - no SQL executed here
+            song = all_songs_cache.get(song_id) or all_songs_cache.get(str(song_id))
+            
             if not song:
                 continue
-            song_name = song.get(SONG_NAME, None)
-            song_hashes = song.get(FIELD_TOTAL_HASHES, None)
-            hashes_matched = dedup_hashes[song_id]
+                
+            song_hashes = song.get(FIELD_TOTAL_HASHES)
+            hashes_matched = dedup_hashes.get(song_id, 0)
+            
+            # Calculate confidence ratios
             fingerprinted_confidence = round(hashes_matched / song_hashes, 2)
             
+            # Filter by threshold to remove weak/false matches early
             if fingerprinted_confidence < confidence_threshold:
                 continue
+                
+            # Convert frame offset to absolute seconds
             nseconds = round(float(offset) / DEFAULT_FS * DEFAULT_WINDOW_SIZE * DEFAULT_OVERLAP_RATIO, 5)
-            song = {
+            
+            # Construct the final result object
+            result = {
                 SONG_ID: song_id,
-                SONG_NAME: song_name.encode("utf8"),
+                SONG_NAME: song.get(SONG_NAME),
                 INPUT_HASHES: queried_hashes,
                 FINGERPRINTED_HASHES: song_hashes,
                 HASHES_MATCHED: hashes_matched,
-                # Percentage regarding hashes matched vs hashes from the input.
                 INPUT_CONFIDENCE: round(hashes_matched / queried_hashes, 2),
-                # Percentage regarding hashes matched vs hashes fingerprinted in the db.
                 FINGERPRINTED_CONFIDENCE: fingerprinted_confidence,
                 OFFSET: offset,
                 OFFSET_SECS: nseconds,
-                FIELD_FILE_SHA1: song.get(FIELD_FILE_SHA1, None).encode("utf8")
+                #FIELD_FILE_SHA1: song.get(FIELD_FILE_SHA1, "").encode("utf8")
             }
 
-            songs_result.append(song)
+            songs_result.append(result)
 
+            # Respect TOPN constraint
             if topn and len(songs_result) >= topn:
                 break
 

@@ -24,6 +24,8 @@ ALIGN_TIME = 'align_time'
 OFFSET = 'offset'
 OFFSET_SECS = 'offset_seconds'
 
+BLACKLISTED_HASH64_COUNT = 500
+
 # DATABASE CLASS INSTANCES:
 DATABASES = {
     'mysql': ("sdio_dejavu.database_handler.mysql_database", "MySQLDatabase"),
