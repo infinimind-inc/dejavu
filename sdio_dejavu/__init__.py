@@ -55,7 +55,7 @@ class Dejavu:
         self.limit = self.config.get("fingerprint_limit", None)
         if self.limit == -1:  # for JSON compatibility
             self.limit = None
-        self.__load_fingerprinted_audio_hashes()
+        #self.__load_fingerprinted_audio_hashes()
 
     def __load_fingerprinted_audio_hashes(self) -> None:
         """
@@ -101,7 +101,7 @@ class Dejavu:
         worker_input = [
             (filename, self.limit)
             for filename in media_list
-            if decoder.unique_hash(filename) not in self.songhashes_set
+            #if decoder.unique_hash(filename) not in self.songhashes_set
         ]
 
         total = len(worker_input)
@@ -173,7 +173,7 @@ class Dejavu:
         worker_input = [
             (filename, self.limit)
             for filename in media_list
-            if decoder.unique_hash(filename) not in self.songhashes_set
+            #if decoder.unique_hash(filename) not in self.songhashes_set
         ]
         logger.info(f"[FP] submitting {len(worker_input)} files with {nprocesses} processes")
 
@@ -237,9 +237,9 @@ class Dejavu:
         filenames_to_fingerprint = []
         for filename, _ in decoder.find_files(path, extensions):
             # don't refingerprint already fingerprinted files
-            if decoder.unique_hash(filename) in self.songhashes_set:
-                print(f"{filename} already fingerprinted, continuing...")
-                continue
+            #if decoder.unique_hash(filename) in self.songhashes_set:
+            #    print(f"{filename} already fingerprinted, continuing...")
+            #    continue
 
             filenames_to_fingerprint.append(filename)
 
@@ -266,7 +266,7 @@ class Dejavu:
 
                 self.db.insert_hashes(sid, hashes)
                 self.db.set_song_fingerprinted(sid)
-                self.__load_fingerprinted_audio_hashes()
+                #self.__load_fingerprinted_audio_hashes()
 
         pool.close()
         pool.join()
@@ -297,19 +297,19 @@ class Dejavu:
         song_hash = decoder.unique_hash(file_path)
         song_name = song_name or song_name_from_path
         # don't refingerprint already fingerprinted files
-        if song_hash in self.songhashes_set:
-            logger.info(f"{song_name} already fingerprinted, continuing...")
-        else:
-            song_name, hashes, file_hash = Dejavu._fingerprint_worker(
-                file_path,
-                self.limit,
-                song_name=song_name
-            )
-            sid = self.db.insert_song(song_name, file_hash)
+        #if song_hash in self.songhashes_set:
+        #    logger.info(f"{song_name} already fingerprinted, continuing...")
+        #else:
+        song_name, hashes, file_hash = Dejavu._fingerprint_worker(
+            file_path,
+            self.limit,
+            song_name=song_name
+        )
+        sid = self.db.insert_song(song_name, file_hash)
 
-            self.db.insert_hashes(sid, hashes)
-            self.db.set_song_fingerprinted(sid)
-            self.__load_fingerprinted_audio_hashes()
+        self.db.insert_hashes(sid, hashes)
+        self.db.set_song_fingerprinted(sid)
+        #self.__load_fingerprinted_audio_hashes()
 
     def generate_fingerprints(self, samples: List[int], Fs=DEFAULT_FS) -> Tuple[List[Tuple[str, int]], float]:
         f"""
@@ -389,6 +389,13 @@ class Dejavu:
         
         return self.db.get_fingerprints_by_song_name_list(cm_ids)
 
+    def get_cm_hashes(
+            self,
+            cm_id:str,
+            )->list[Tuple[int,int]]:
+        hashes = self.db.get_fingerprints_by_song_name(cm_id)
+        return hashes
+        
     def get_similar_cm_ids_hash64(
             self, 
             cm_id: str,
