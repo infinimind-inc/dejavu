@@ -89,8 +89,9 @@ class Dejavu:
         self,
         media_list: list[str],
         nprocesses: int | None = None,
-        db_batch_size: int = 10,
-        hash_batch_size: int = 2000,
+        db_batch_size: int = 20,
+        hash_batch_size: int = 5000,
+        is_copy: bool = False,
     ):
         """
         Multiprocess fingerprinting (CPU-bound).
@@ -126,7 +127,10 @@ class Dejavu:
             with self.db.cursor() as cur:
                 for song_name, hashes, file_hash in pending:
                     sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                    self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
+                    if is_copy and hasattr(self.db, "insert_hashes_copy"):
+                        self.db.insert_hashes_copy(sid, hashes, cur=cur)
+                    else:
+                        self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
                     self.db.set_song_fingerprinted(sid, cur=cur)
             pending.clear()
 
@@ -182,6 +186,7 @@ class Dejavu:
         nprocesses: int | None = None,
         db_batch_size: int = 10,
         hash_batch_size: int = 2000,
+        is_copy: bool = False,
         ):
         nprocesses = nprocesses or max(1, min(4, os.cpu_count() or 2))
         failed_files = []
@@ -208,7 +213,10 @@ class Dejavu:
             with self.db.cursor() as cur:
                 for song_name, hashes, file_hash in pending:
                     sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                    self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
+                    if is_copy and hasattr(self.db, "insert_hashes_copy"):
+                        self.db.insert_hashes_copy(sid, hashes, cur=cur)
+                    else:
+                        self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
                     self.db.set_song_fingerprinted(sid, cur=cur)
             pending.clear()
 

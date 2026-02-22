@@ -1,5 +1,6 @@
 import queue
 
+import io
 import psycopg2
 from psycopg2.extras import DictCursor
 from sdio_dejavu.base_classes.common_database import CommonDatabase
@@ -126,6 +127,8 @@ class PostgreSQLDatabase(CommonDatabase):
         FROM "{SONGS_TABLENAME}"
         WHERE "{FIELD_SONGNAME}" = %s;
     """
+
+    COPY_TEMP_TABLE = "tmp_fp_audio_fingerprints"
 
     # SELECTS
     SELECT = f"""
@@ -297,6 +300,55 @@ class PostgreSQLDatabase(CommonDatabase):
                 return row[0]
             cur.execute(self.SELECT_SONG_ID_BY_NAME, (song_name,))
             return cur.fetchone()[0]
+
+    def insert_hashes_copy(self, song_id: int, hashes: list[tuple], cur=None) -> None:
+        """
+        Fast path: COPY into a temp table, then INSERT ... ON CONFLICT DO NOTHING.
+        """
+        if cur is None:
+            with self.cursor() as cur:
+                self.insert_hashes_copy(song_id, hashes, cur=cur)
+            return
+
+        cur.execute(f"""
+            CREATE TEMP TABLE IF NOT EXISTS {self.COPY_TEMP_TABLE} (
+                "{FIELD_SONG_ID}" INT NOT NULL,
+                "{FIELD_HASH}" BYTEA,
+                "{FIELD_HASH64}" BIGINT,
+                "{FIELD_OFFSET}" INT NOT NULL
+            ) ON COMMIT DROP;
+        """)
+        cur.execute(f"TRUNCATE {self.COPY_TEMP_TABLE};")
+
+        buf = io.StringIO()
+        for item in hashes:
+            if len(item) == 3:
+                hsh, hsh_64, offset = item
+            elif len(item) == 2:
+                hsh, offset = item
+                hsh_64 = None
+            else:
+                raise ValueError(f"Unexpected hash tuple length: {len(item)}")
+
+            hash_text = f"\\\\x{hsh}" if hsh is not None else "\\\\N"
+            hash64_text = str(hsh_64) if hsh_64 is not None else "\\\\N"
+            buf.write(f"{song_id},{hash_text},{hash64_text},{int(offset)}\n")
+
+        buf.seek(0)
+        copy_sql = (
+            f'COPY {self.COPY_TEMP_TABLE} ("{FIELD_SONG_ID}","{FIELD_HASH}","{FIELD_HASH64}","{FIELD_OFFSET}") '
+            "FROM STDIN WITH (FORMAT csv, NULL '\\N')"
+        )
+        cur.copy_expert(copy_sql, buf)
+
+        cur.execute(f"""
+            INSERT INTO "{FINGERPRINTS_TABLENAME}" (
+                "{FIELD_SONG_ID}", "{FIELD_HASH}", "{FIELD_HASH64}", "{FIELD_OFFSET}"
+            )
+            SELECT "{FIELD_SONG_ID}", "{FIELD_HASH}", "{FIELD_HASH64}", "{FIELD_OFFSET}"
+            FROM {self.COPY_TEMP_TABLE}
+            ON CONFLICT DO NOTHING;
+        """)
 
     def __getstate__(self):
         return self._options,
