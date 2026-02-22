@@ -89,6 +89,8 @@ class Dejavu:
         self,
         media_list: list[str],
         nprocesses: int | None = None,
+        db_batch_size: int = 10,
+        hash_batch_size: int = 2000,
     ):
         """
         Multiprocess fingerprinting (CPU-bound).
@@ -116,6 +118,18 @@ class Dejavu:
 
         submitted: dict[concurrent.futures.Future, str] = {}
 
+        pending: list[tuple[str, list, str]] = []
+
+        def flush_pending():
+            if not pending:
+                return
+            with self.db.cursor() as cur:
+                for song_name, hashes, file_hash in pending:
+                    sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
+                    self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
+                    self.db.set_song_fingerprinted(sid, cur=cur)
+            pending.clear()
+
         with ProcessPoolExecutor(
             max_workers=nprocesses,
             mp_context=multiprocessing.get_context("spawn"),
@@ -136,10 +150,9 @@ class Dejavu:
                 try:
                     song_name, hashes, file_hash = fut.result(timeout=timeout_s)
 
-                    with self.db.cursor() as cur:
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                        self.db.insert_hashes(sid, hashes, cur=cur)
-                        self.db.set_song_fingerprinted(sid, cur=cur)
+                    pending.append((song_name, hashes, file_hash))
+                    if len(pending) >= db_batch_size:
+                        flush_pending()
 
                 except concurrent.futures.TimeoutError:
                     logger.error(f"[FP] timeout: {filename}")
@@ -151,6 +164,8 @@ class Dejavu:
 
                 finally:
                     pbar.update(1)
+
+            flush_pending()
 
         logger.info(
             f"[FP] done. ok={total - len(failed_files)} "
@@ -164,7 +179,9 @@ class Dejavu:
     def fingerprint_media_list_multiprocess(
         self, 
         media_list: list[str], 
-        nprocesses: int | None = None
+        nprocesses: int | None = None,
+        db_batch_size: int = 10,
+        hash_batch_size: int = 2000,
         ):
         nprocesses = nprocesses or max(1, min(4, os.cpu_count() or 2))
         failed_files = []
@@ -183,6 +200,18 @@ class Dejavu:
 
         # Small chunks keep latency predictable
         timeout_s = 120  # per-file guard; tune to your media
+        pending: list[tuple[str, list, str]] = []
+
+        def flush_pending():
+            if not pending:
+                return
+            with self.db.cursor() as cur:
+                for song_name, hashes, file_hash in pending:
+                    sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
+                    self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
+                    self.db.set_song_fingerprinted(sid, cur=cur)
+            pending.clear()
+
         with ProcessPoolExecutor(max_workers=nprocesses, mp_context=multiprocessing.get_context("spawn")) as ex:
             futures = []
             for item in worker_input:
@@ -197,10 +226,9 @@ class Dejavu:
                 try:
                     song_name, hashes, file_hash = fut.result(timeout=timeout_s)
                     # DB writes in parent only (good). Wrap in retry + timeout.
-                    with self.db.cursor() as cur:
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                        self.db.insert_hashes(sid, hashes, cur=cur)
-                        self.db.set_song_fingerprinted(sid, cur=cur)
+                    pending.append((song_name, hashes, file_hash))
+                    if len(pending) >= db_batch_size:
+                        flush_pending()
                     completed += 1
                     if completed % 50 == 0:
                         logger.info(f"[FP] progress: {completed}/{len(futures)} (elapsed {time.perf_counter()-start_time:.1f}s)")
@@ -212,6 +240,7 @@ class Dejavu:
                     failed_files.append(fn)
 
         logger.info(f"[FP] done. ok={completed} fail={len(failed_files)} elapsed={time.perf_counter()-start_time:.1f}s")
+        flush_pending()
         return failed_files
 
 

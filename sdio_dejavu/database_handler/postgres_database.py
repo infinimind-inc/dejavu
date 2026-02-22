@@ -117,7 +117,14 @@ class PostgreSQLDatabase(CommonDatabase):
     INSERT_SONG = f"""
         INSERT INTO "{SONGS_TABLENAME}" ("{FIELD_SONGNAME}", "{FIELD_FILE_SHA1}","{FIELD_TOTAL_HASHES}")
         VALUES (%s, decode(%s, 'hex'), %s)
+        ON CONFLICT ("{FIELD_SONGNAME}") DO NOTHING
         RETURNING "{FIELD_SONG_ID}";
+    """
+
+    SELECT_SONG_ID_BY_NAME = f"""
+        SELECT "{FIELD_SONG_ID}"
+        FROM "{SONGS_TABLENAME}"
+        WHERE "{FIELD_SONGNAME}" = %s;
     """
 
     # SELECTS
@@ -278,9 +285,17 @@ class PostgreSQLDatabase(CommonDatabase):
         """
         if cur is not None:
             cur.execute(self.INSERT_SONG, (song_name, file_hash, total_hashes))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            cur.execute(self.SELECT_SONG_ID_BY_NAME, (song_name,))
             return cur.fetchone()[0]
         with self.cursor() as cur:
             cur.execute(self.INSERT_SONG, (song_name, file_hash, total_hashes))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            cur.execute(self.SELECT_SONG_ID_BY_NAME, (song_name,))
             return cur.fetchone()[0]
 
     def __getstate__(self):

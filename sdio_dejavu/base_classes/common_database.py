@@ -306,7 +306,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         self,
         song_id: int,
         hashes: list[Tuple[str, int, int]],
-        batch_size: int = 1000,
+        batch_size: int = 2000,
         cur=None,
     ) -> None:
         """
