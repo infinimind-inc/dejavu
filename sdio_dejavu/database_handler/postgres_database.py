@@ -301,13 +301,17 @@ class PostgreSQLDatabase(CommonDatabase):
             cur.execute(self.SELECT_SONG_ID_BY_NAME, (song_name,))
             return cur.fetchone()[0]
 
-    def insert_hashes_copy(self, song_id: int, hashes: list[tuple], cur=None) -> None:
+    def insert_hashes_copy_batch(self, batch: list[tuple[int, list[tuple]]], cur=None) -> None:
         """
-        Fast path: COPY into a temp table, then INSERT ... ON CONFLICT DO NOTHING.
+        Fast path: COPY a whole batch into a temp table, then INSERT ... ON CONFLICT DO NOTHING.
+        batch: [(song_id, hashes), ...]
         """
+        if not batch:
+            return
+
         if cur is None:
             with self.cursor() as cur:
-                self.insert_hashes_copy(song_id, hashes, cur=cur)
+                self.insert_hashes_copy_batch(batch, cur=cur)
             return
 
         cur.execute(f"""
@@ -321,18 +325,19 @@ class PostgreSQLDatabase(CommonDatabase):
         cur.execute(f"TRUNCATE {self.COPY_TEMP_TABLE};")
 
         buf = io.StringIO()
-        for item in hashes:
-            if len(item) == 3:
-                hsh, hsh_64, offset = item
-            elif len(item) == 2:
-                hsh, offset = item
-                hsh_64 = None
-            else:
-                raise ValueError(f"Unexpected hash tuple length: {len(item)}")
+        for song_id, hashes in batch:
+            for item in hashes:
+                if len(item) == 3:
+                    hsh, hsh_64, offset = item
+                elif len(item) == 2:
+                    hsh, offset = item
+                    hsh_64 = None
+                else:
+                    raise ValueError(f"Unexpected hash tuple length: {len(item)}")
 
-            hash_text = f"\\\\x{hsh}" if hsh is not None else "\\\\N"
-            hash64_text = str(hsh_64) if hsh_64 is not None else "\\\\N"
-            buf.write(f"{song_id},{hash_text},{hash64_text},{int(offset)}\n")
+                hash_text = f"\\\\x{hsh}" if hsh is not None else "\\\\N"
+                hash64_text = str(hsh_64) if hsh_64 is not None else "\\\\N"
+                buf.write(f"{song_id},{hash_text},{hash64_text},{int(offset)}\n")
 
         buf.seek(0)
         copy_sql = (

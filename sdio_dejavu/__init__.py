@@ -125,13 +125,18 @@ class Dejavu:
             if not pending:
                 return
             with self.db.cursor() as cur:
-                for song_name, hashes, file_hash in pending:
-                    sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                    if is_copy and hasattr(self.db, "insert_hashes_copy"):
-                        self.db.insert_hashes_copy(sid, hashes, cur=cur)
-                    else:
+                if is_copy and hasattr(self.db, "insert_hashes_copy_batch"):
+                    batch = []
+                    for song_name, hashes, file_hash in pending:
+                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
+                        batch.append((sid, hashes))
+                        self.db.set_song_fingerprinted(sid, cur=cur)
+                    self.db.insert_hashes_copy_batch(batch, cur=cur)
+                else:
+                    for song_name, hashes, file_hash in pending:
+                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
                         self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
-                    self.db.set_song_fingerprinted(sid, cur=cur)
+                        self.db.set_song_fingerprinted(sid, cur=cur)
             pending.clear()
 
         with ProcessPoolExecutor(
@@ -211,13 +216,18 @@ class Dejavu:
             if not pending:
                 return
             with self.db.cursor() as cur:
-                for song_name, hashes, file_hash in pending:
-                    sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                    if is_copy and hasattr(self.db, "insert_hashes_copy"):
-                        self.db.insert_hashes_copy(sid, hashes, cur=cur)
-                    else:
+                if is_copy and hasattr(self.db, "insert_hashes_copy_batch"):
+                    batch = []
+                    for song_name, hashes, file_hash in pending:
+                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
+                        batch.append((sid, hashes))
+                        self.db.set_song_fingerprinted(sid, cur=cur)
+                    self.db.insert_hashes_copy_batch(batch, cur=cur)
+                else:
+                    for song_name, hashes, file_hash in pending:
+                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
                         self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
-                    self.db.set_song_fingerprinted(sid, cur=cur)
+                        self.db.set_song_fingerprinted(sid, cur=cur)
             pending.clear()
 
         with ProcessPoolExecutor(max_workers=nprocesses, mp_context=multiprocessing.get_context("spawn")) as ex:
