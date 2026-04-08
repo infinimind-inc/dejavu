@@ -89,9 +89,6 @@ class Dejavu:
         self,
         media_list: list[str],
         nprocesses: int | None = None,
-        db_batch_size: int = 20,
-        hash_batch_size: int = 5000,
-        is_copy: bool = False,
     ):
         """
         Multiprocess fingerprinting (CPU-bound).
@@ -119,36 +116,6 @@ class Dejavu:
 
         submitted: dict[concurrent.futures.Future, str] = {}
 
-        pending: list[tuple[str, list, str]] = []
-        total_hashes = 0
-        total_db_time = 0.0
-        total_wait_time = 0.0
-        total_flushes = 0
-
-        def flush_pending():
-            nonlocal total_db_time, total_flushes, total_hashes
-            if not pending:
-                return
-            t0 = time.perf_counter()
-            with self.db.cursor() as cur:
-                if is_copy and hasattr(self.db, "insert_hashes_copy_batch"):
-                    batch = []
-                    for song_name, hashes, file_hash in pending:
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                        batch.append((sid, hashes))
-                        total_hashes += len(hashes)
-                        self.db.set_song_fingerprinted(sid, cur=cur)
-                    self.db.insert_hashes_copy_batch(batch, cur=cur)
-                else:
-                    for song_name, hashes, file_hash in pending:
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                        total_hashes += len(hashes)
-                        self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
-                        self.db.set_song_fingerprinted(sid, cur=cur)
-            total_db_time += time.perf_counter() - t0
-            total_flushes += 1
-            pending.clear()
-
         with ProcessPoolExecutor(
             max_workers=nprocesses,
             mp_context=multiprocessing.get_context("spawn"),
@@ -167,13 +134,12 @@ class Dejavu:
             for fut in as_completed(submitted):
                 filename = submitted[fut]
                 try:
-                    t_wait0 = time.perf_counter()
                     song_name, hashes, file_hash = fut.result(timeout=timeout_s)
-                    total_wait_time += time.perf_counter() - t_wait0
 
-                    pending.append((song_name, hashes, file_hash))
-                    if len(pending) >= db_batch_size:
-                        flush_pending()
+                    with self.db.cursor():
+                        sid = self.db.insert_song(song_name, file_hash, len(hashes))
+                        self.db.insert_hashes(sid, hashes)
+                        self.db.set_song_fingerprinted(sid)
 
                 except concurrent.futures.TimeoutError:
                     logger.error(f"[FP] timeout: {filename}")
@@ -186,21 +152,10 @@ class Dejavu:
                 finally:
                     pbar.update(1)
 
-            flush_pending()
-
         logger.info(
             f"[FP] done. ok={total - len(failed_files)} "
             f"fail={len(failed_files)} "
             f"elapsed={time.perf_counter() - start_time:.1f}s"
-        )
-        elapsed = time.perf_counter() - start_time
-        logger.info(
-            f"[FP] stats: files={total} "
-            f"hashes={total_hashes} "
-            f"wait_time={total_wait_time:.2f}s "
-            f"db_time={total_db_time:.2f}s "
-            f"flushes={total_flushes} "
-            f"throughput={total/elapsed:.2f} file/s"
         )
         return failed_files
 
@@ -209,10 +164,7 @@ class Dejavu:
     def fingerprint_media_list_multiprocess(
         self, 
         media_list: list[str], 
-        nprocesses: int | None = None,
-        db_batch_size: int = 10,
-        hash_batch_size: int = 2000,
-        is_copy: bool = False,
+        nprocesses: int | None = None
         ):
         nprocesses = nprocesses or max(1, min(4, os.cpu_count() or 2))
         failed_files = []
@@ -231,26 +183,6 @@ class Dejavu:
 
         # Small chunks keep latency predictable
         timeout_s = 120  # per-file guard; tune to your media
-        pending: list[tuple[str, list, str]] = []
-
-        def flush_pending():
-            if not pending:
-                return
-            with self.db.cursor() as cur:
-                if is_copy and hasattr(self.db, "insert_hashes_copy_batch"):
-                    batch = []
-                    for song_name, hashes, file_hash in pending:
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                        batch.append((sid, hashes))
-                        self.db.set_song_fingerprinted(sid, cur=cur)
-                    self.db.insert_hashes_copy_batch(batch, cur=cur)
-                else:
-                    for song_name, hashes, file_hash in pending:
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes), cur=cur)
-                        self.db.insert_hashes(sid, hashes, batch_size=hash_batch_size, cur=cur)
-                        self.db.set_song_fingerprinted(sid, cur=cur)
-            pending.clear()
-
         with ProcessPoolExecutor(max_workers=nprocesses, mp_context=multiprocessing.get_context("spawn")) as ex:
             futures = []
             for item in worker_input:
@@ -265,9 +197,10 @@ class Dejavu:
                 try:
                     song_name, hashes, file_hash = fut.result(timeout=timeout_s)
                     # DB writes in parent only (good). Wrap in retry + timeout.
-                    pending.append((song_name, hashes, file_hash))
-                    if len(pending) >= db_batch_size:
-                        flush_pending()
+                    with self.db.cursor() as cur:
+                        sid = self.db.insert_song(song_name, file_hash, len(hashes))
+                        self.db.insert_hashes(sid, hashes)
+                        self.db.set_song_fingerprinted(sid)
                     completed += 1
                     if completed % 50 == 0:
                         logger.info(f"[FP] progress: {completed}/{len(futures)} (elapsed {time.perf_counter()-start_time:.1f}s)")
@@ -279,7 +212,6 @@ class Dejavu:
                     failed_files.append(fn)
 
         logger.info(f"[FP] done. ok={completed} fail={len(failed_files)} elapsed={time.perf_counter()-start_time:.1f}s")
-        flush_pending()
         return failed_files
 
 
@@ -443,8 +375,8 @@ class Dejavu:
     def set_blacklisted_hashes(self,blacklisted_hashes:set[int]):
         self.db.set_blacklisted_hashes(blacklisted_hashes)
     
-    def get_blacklisted_hashes(self)->set[int]:
-        return self.db.get_blacklisted_hashes()
+    def get_blacklisted_hashes(self,threshold:int)->set[int]:
+        return self.db.get_blacklisted_hashes(threshold)
 
     def prefetch_fingerprints_batch(
             self, 
@@ -496,7 +428,7 @@ class Dejavu:
             dedup_hashes, 
             len(hashes), 
             confidence_threshold=threshold, 
-            use_unnest=False,
+            use_unnest=use_unnest,
             verbose=verbose,
         )
         metrics["align_matches"] = time.time() - t_now
@@ -634,7 +566,7 @@ class Dejavu:
 
     def align_matches_unnest(
         self,
-        matches: list[tuple[int, int]],
+        matches: list[tuple[int, int] | tuple[int, int, int]],
         dedup_hashes: dict[int, int],
         queried_hashes: int,
         topn: int = TOPN,
@@ -646,8 +578,13 @@ class Dejavu:
         # ----------------------------------------
         offset_votes: dict[int, Counter] = defaultdict(Counter)
 
-        for song_id, offset_diff in matches:
-            offset_votes[song_id][offset_diff] += 1
+        for match in matches:
+            if len(match) == 3:
+                song_id, offset_diff, vote_count = match
+                offset_votes[song_id][offset_diff] += vote_count
+            else:
+                song_id, offset_diff = match
+                offset_votes[song_id][offset_diff] += 1
 
         # ----------------------------------------
         # 2. 对每个 song，取票数最多的 offset
@@ -678,7 +615,7 @@ class Dejavu:
             for s in self.db.get_songs_by_ids(song_ids)
         }
         """
-        songs_meta = {s[SONG_ID]: s for s in self.db.get_songs()}
+        songs_meta = self._get_song_map_int()
 
         # ----------------------------------------
         # 5. 组装最终结果 + confidence 过滤
@@ -686,7 +623,7 @@ class Dejavu:
         results = []
 
         for song_id, offset, _ in song_best:
-            song = songs_meta.get(song_id)
+            song = songs_meta.get(song_id) or songs_meta.get(str(song_id))
             if not song:
                 continue
 
@@ -695,7 +632,7 @@ class Dejavu:
                 continue
 
             hashes_matched = dedup_hashes.get(song_id, 0)
-            fingerprinted_conf = hashes_matched / song_hashes
+            fingerprinted_conf = round(hashes_matched / song_hashes, 2)
 
             if fingerprinted_conf < confidence_threshold:
                 continue
@@ -714,10 +651,10 @@ class Dejavu:
                 FINGERPRINTED_HASHES: song_hashes,
                 HASHES_MATCHED: hashes_matched,
                 INPUT_CONFIDENCE: round(hashes_matched / queried_hashes, 2),
-                FINGERPRINTED_CONFIDENCE: round(fingerprinted_conf, 2),
+                FINGERPRINTED_CONFIDENCE: fingerprinted_conf,
                 OFFSET: offset,
                 OFFSET_SECS: nseconds,
-                FIELD_FILE_SHA1: song.get(FIELD_FILE_SHA1).encode("utf8"),
+                FIELD_FILE_SHA1: song.get(FIELD_FILE_SHA1, ""),
             })
 
         return results
@@ -795,7 +732,7 @@ class Dejavu:
 
     def align_matches(
             self, 
-            matches: list[Tuple[int, int]], 
+            matches: list[Tuple[int, int] | Tuple[int, int, int]], 
             dedup_hashes: dict[str, int], 
             queried_hashes: int,
             topn: int = None,
@@ -805,27 +742,44 @@ class Dejavu:
         ) -> list[dict[str, any]]:
 
         if verbose:
-            song_ids = [m[0] for m in matches]
-            unique_songs = len(set(song_ids))
-            total_matches = len(matches)
-            
-            top_3_songs = Counter(song_ids).most_common(3)
+            song_votes = Counter()
+            total_matches = 0
+            for match in matches:
+                song_id = match[0]
+                vote_count = match[2] if len(match) == 3 else 1
+                song_votes[song_id] += vote_count
+                total_matches += vote_count
+            unique_songs = len(song_votes)
+            top_3_songs = song_votes.most_common(3)
+            avg_matches = (total_matches / unique_songs) if unique_songs else 0
             
             logger.debug(
                 f"\n[Align Analysis]\n"
                 f"- Input Queried Hashes: {queried_hashes}\n"
                 f"- Total Matches (N): {total_matches}\n"
                 f"- Unique Songs: {unique_songs}\n"
-                f"- Avg Matches per Song: {total_matches/unique_songs:.2f}\n"
+                f"- Avg Matches per Song: {avg_matches:.2f}\n"
                 f"- Top 3 Match Heavy Songs: {top_3_songs}\n"
                 f"- Use Unnest Mode: {use_unnest}"
             )
 
-        counts = Counter(m[0] for m in matches)
+        counts = Counter()
+        for match in matches:
+            song_id = match[0]
+            vote_count = match[2] if len(match) == 3 else 1
+            counts[song_id] += vote_count
+
         valid_song_ids = {s_id for s_id, count in counts.items() if count > 5}
-        filtered_matches = [m for m in matches if m[0] in valid_song_ids]
+        filtered_matches = [match for match in matches if match[0] in valid_song_ids]
         if verbose:
-            logger.debug(f"- Filtered_matches {len(filtered_matches)}")
+            if use_unnest:
+                filtered_vote_total = sum(match[2] if len(match) == 3 else 1 for match in filtered_matches)
+                logger.debug(
+                    f"- Filtered_matches {len(filtered_matches)} grouped rows "
+                    f"({filtered_vote_total} total votes)"
+                )
+            else:
+                logger.debug(f"- Filtered_matches {len(filtered_matches)}")
         if use_unnest:
             return self.align_matches_unnest(filtered_matches,dedup_hashes,queried_hashes,topn,confidence_threshold)
         else:

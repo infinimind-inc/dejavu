@@ -1,14 +1,14 @@
 import queue
 
-import io
 import psycopg2
 from psycopg2.extras import DictCursor
+from datetime import datetime, timedelta
 from sdio_dejavu.base_classes.common_database import CommonDatabase
 from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
                                     FIELD_HASH, FIELD_OFFSET, FIELD_SONG_ID,
                                     FIELD_HASH64,
                                     FIELD_SONGNAME, FIELD_TOTAL_HASHES,
-                                    FINGERPRINTS_TABLENAME, SONGS_TABLENAME)
+                                    FINGERPRINTS_TABLENAME, SONGS_TABLENAME,DAILY_PARTITION)
 
 
 class PostgreSQLDatabase(CommonDatabase):
@@ -104,31 +104,11 @@ class PostgreSQLDatabase(CommonDatabase):
         VALUES (%s, decode(%s, 'hex'), %s, %s) ON CONFLICT DO NOTHING;
     """
 
-    INSERT_FINGERPRINT_TEMPLATE = "(%s, decode(%s, 'hex'), %s, %s)"
-
-    INSERT_FINGERPRINT_VALUES = f"""
-        INSERT INTO "{FINGERPRINTS_TABLENAME}" (
-                "{FIELD_SONG_ID}"
-            ,   "{FIELD_HASH}"
-            ,   "{FIELD_HASH64}"
-            ,   "{FIELD_OFFSET}")
-        VALUES %s ON CONFLICT DO NOTHING;
-    """
-
     INSERT_SONG = f"""
         INSERT INTO "{SONGS_TABLENAME}" ("{FIELD_SONGNAME}", "{FIELD_FILE_SHA1}","{FIELD_TOTAL_HASHES}")
         VALUES (%s, decode(%s, 'hex'), %s)
-        ON CONFLICT ("{FIELD_SONGNAME}") DO NOTHING
         RETURNING "{FIELD_SONG_ID}";
     """
-
-    SELECT_SONG_ID_BY_NAME = f"""
-        SELECT "{FIELD_SONG_ID}"
-        FROM "{SONGS_TABLENAME}"
-        WHERE "{FIELD_SONGNAME}" = %s;
-    """
-
-    COPY_TEMP_TABLE = "tmp_fp_audio_fingerprints"
 
     # SELECTS
     SELECT = f"""
@@ -161,6 +141,23 @@ class PostgreSQLDatabase(CommonDatabase):
     FROM input_hashes i
     JOIN {FINGERPRINTS_TABLENAME}  f
     ON f.{FIELD_HASH64} = i.{FIELD_HASH64};
+    """
+
+    MATCHES_HASH64_UNNEST_GROUPED = f"""
+    WITH input_hashes({FIELD_HASH64}, input_offset) AS (
+        SELECT *
+        FROM UNNEST(%s::bigint[], %s::int[])
+    )
+    SELECT
+        f.{FIELD_SONG_ID},
+        f.{FIELD_OFFSET} - i.input_offset AS offset_diff,
+        COUNT(*) AS vote_count
+    FROM input_hashes i
+    JOIN {FINGERPRINTS_TABLENAME} f
+      ON f.{FIELD_HASH64} = i.{FIELD_HASH64}
+    GROUP BY
+        f.{FIELD_SONG_ID},
+        f.{FIELD_OFFSET} - i.input_offset;
     """
 
     SELECT_FINGERPRINTS_BY_SONG_NAME = f"""
@@ -213,6 +210,8 @@ class PostgreSQLDatabase(CommonDatabase):
         GROUP BY {FIELD_HASH64}
         HAVING COUNT(*) > %s;
     """
+
+    SELECT_BLACKLISTED_HASHED_VIEW = f"""SELECT hash64 FROM fp_hash_stats WHERE freq > %s;"""
 
     SELECT_UNIQUE_SONG_IDS = f"""
         SELECT COUNT("{FIELD_SONG_ID}") AS n
@@ -269,6 +268,41 @@ class PostgreSQLDatabase(CommonDatabase):
         super().__init__()
         self.cursor = cursor_factory(**options)
         self._options = options
+    
+    def ensure_daily_partition(self) -> None:
+        if DAILY_PARTITION:
+            pass
+        else:
+            return
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+        part_name = f'{FINGERPRINTS_TABLENAME}_{today.year}_{today.month:02d}_{today.day:02d}'
+        start = f"{today} 00:00:00+09"
+        end = f"{tomorrow} 00:00:00+09"
+
+        with self.cursor() as cur:
+            # 20251107: Advisory lock for daily partition creation (fingerprints)
+            try:
+                cur.execute("SELECT pg_advisory_lock(20251107);")
+
+
+                cur.execute(f"""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_tables WHERE tablename = '{part_name}'
+                        ) THEN
+                            EXECUTE format('
+                                CREATE TABLE IF NOT EXISTS {part_name}
+                                PARTITION OF {FINGERPRINTS_TABLENAME}
+                                FOR VALUES FROM (%L) TO (%L);
+                            ', '{start}', '{end}');
+                        END IF;
+                    END $$;
+                """)
+            finally:
+                # Release the lock
+                cur.execute("SELECT pg_advisory_unlock(20251107);")
 
         
     def after_fork(self) -> None:
@@ -276,7 +310,7 @@ class PostgreSQLDatabase(CommonDatabase):
         # the previous process.
         Cursor.clear_cache()
 
-    def insert_song(self, song_name: str, file_hash: str, total_hashes: int, cur=None) -> int:
+    def insert_song(self, song_name: str, file_hash: str, total_hashes: int) -> int:
         """
         Inserts a song name into the database, returns the new
         identifier of the song.
@@ -286,74 +320,9 @@ class PostgreSQLDatabase(CommonDatabase):
         :param total_hashes: amount of hashes to be inserted on fingerprint table.
         :return: the inserted id.
         """
-        if cur is not None:
-            cur.execute(self.INSERT_SONG, (song_name, file_hash, total_hashes))
-            row = cur.fetchone()
-            if row:
-                return row[0]
-            cur.execute(self.SELECT_SONG_ID_BY_NAME, (song_name,))
-            return cur.fetchone()[0]
         with self.cursor() as cur:
             cur.execute(self.INSERT_SONG, (song_name, file_hash, total_hashes))
-            row = cur.fetchone()
-            if row:
-                return row[0]
-            cur.execute(self.SELECT_SONG_ID_BY_NAME, (song_name,))
             return cur.fetchone()[0]
-
-    def insert_hashes_copy_batch(self, batch: list[tuple[int, list[tuple]]], cur=None) -> None:
-        """
-        Fast path: COPY a whole batch into a temp table, then INSERT ... ON CONFLICT DO NOTHING.
-        batch: [(song_id, hashes), ...]
-        """
-        if not batch:
-            return
-
-        if cur is None:
-            with self.cursor() as cur:
-                self.insert_hashes_copy_batch(batch, cur=cur)
-            return
-
-        cur.execute(f"""
-            CREATE TEMP TABLE IF NOT EXISTS {self.COPY_TEMP_TABLE} (
-                "{FIELD_SONG_ID}" INT NOT NULL,
-                "{FIELD_HASH}" BYTEA,
-                "{FIELD_HASH64}" BIGINT,
-                "{FIELD_OFFSET}" INT NOT NULL
-            ) ON COMMIT DROP;
-        """)
-        cur.execute(f"TRUNCATE {self.COPY_TEMP_TABLE};")
-
-        buf = io.StringIO()
-        for song_id, hashes in batch:
-            for item in hashes:
-                if len(item) == 3:
-                    hsh, hsh_64, offset = item
-                elif len(item) == 2:
-                    hsh, offset = item
-                    hsh_64 = None
-                else:
-                    raise ValueError(f"Unexpected hash tuple length: {len(item)}")
-
-                hash_text = f"\\\\x{hsh}" if hsh is not None else "\\\\N"
-                hash64_text = str(hsh_64) if hsh_64 is not None else "\\\\N"
-                buf.write(f"{song_id},{hash_text},{hash64_text},{int(offset)}\n")
-
-        buf.seek(0)
-        copy_sql = (
-            f'COPY {self.COPY_TEMP_TABLE} ("{FIELD_SONG_ID}","{FIELD_HASH}","{FIELD_HASH64}","{FIELD_OFFSET}") '
-            "FROM STDIN WITH (FORMAT csv, NULL '\\N')"
-        )
-        cur.copy_expert(copy_sql, buf)
-
-        cur.execute(f"""
-            INSERT INTO "{FINGERPRINTS_TABLENAME}" (
-                "{FIELD_SONG_ID}", "{FIELD_HASH}", "{FIELD_HASH64}", "{FIELD_OFFSET}"
-            )
-            SELECT "{FIELD_SONG_ID}", "{FIELD_HASH}", "{FIELD_HASH64}", "{FIELD_OFFSET}"
-            FROM {self.COPY_TEMP_TABLE}
-            ON CONFLICT DO NOTHING;
-        """)
 
     def __getstate__(self):
         return self._options,
@@ -378,25 +347,16 @@ class Cursor(object):
         cur.execute(query)
         ...
     """
-    _cache = queue.Queue(maxsize=5)
-
     def __init__(self, dictionary=False, **options):
         super().__init__()
 
-        conn = None
-        try:
-            conn = Cursor._cache.get_nowait()
-            try:
-                if hasattr(conn, "ping"):
-                    conn.ping(True)
-                elif getattr(conn, "closed", 0) != 0:
-                    conn = None
-            except Exception:
-                conn = None
-        except queue.Empty:
-            conn = None
+        self._cache = queue.Queue(maxsize=5)
 
-        if conn is None:
+        try:
+            conn = self._cache.get_nowait()
+            # Ping the connection before using it from the cache.
+            conn.ping(True)
+        except queue.Empty:
             conn = psycopg2.connect(**options)
 
         self.conn = conn
@@ -423,6 +383,6 @@ class Cursor(object):
 
         # Put it back on the queue
         try:
-            Cursor._cache.put_nowait(self.conn)
+            self._cache.put_nowait(self.conn)
         except queue.Full:
             self.conn.close()
