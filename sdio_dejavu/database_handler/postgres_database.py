@@ -2,6 +2,7 @@ import queue
 
 import psycopg2
 from psycopg2.extras import DictCursor
+from loguru import logger
 from datetime import datetime, timedelta
 from sdio_dejavu.base_classes.common_database import CommonDatabase
 from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
@@ -9,6 +10,8 @@ from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
                                     FIELD_HASH64,
                                     FIELD_SONGNAME, FIELD_TOTAL_HASHES,
                                     FINGERPRINTS_TABLENAME, SONGS_TABLENAME,DAILY_PARTITION)
+
+PK_SONG_ID_CONSTRAINT = f"pk_{SONGS_TABLENAME}_{FIELD_SONG_ID}"
 
 
 class PostgreSQLDatabase(CommonDatabase):
@@ -320,9 +323,40 @@ class PostgreSQLDatabase(CommonDatabase):
         :param total_hashes: amount of hashes to be inserted on fingerprint table.
         :return: the inserted id.
         """
-        with self.cursor() as cur:
-            cur.execute(self.INSERT_SONG, (song_name, file_hash, total_hashes))
-            return cur.fetchone()[0]
+        retried = False
+        while True:
+            with self.cursor() as cur:
+                try:
+                    cur.execute(self.INSERT_SONG, (song_name, file_hash, total_hashes))
+                    return cur.fetchone()[0]
+                except psycopg2.errors.UniqueViolation as e:
+                    constraint_name = getattr(getattr(e, "diag", None), "constraint_name", "")
+                    is_song_id_pk_collision = (
+                        constraint_name == PK_SONG_ID_CONSTRAINT
+                        or PK_SONG_ID_CONSTRAINT in str(e)
+                    )
+                    if not is_song_id_pk_collision or retried:
+                        raise
+
+                    # Sequence drift can cause PK collision on song_id. Realign and retry once.
+                    cur.connection.rollback()
+                    next_song_id = self._sync_song_id_sequence(cur)
+                    logger.warning(
+                        "[FP][DB] synced {} sequence to {} after PK collision; retry insert for song_name={}",
+                        FIELD_SONG_ID,
+                        next_song_id,
+                        song_name,
+                    )
+                    retried = True
+
+    def _sync_song_id_sequence(self, cur) -> int:
+        cur.execute(f'SELECT COALESCE(MAX("{FIELD_SONG_ID}"), 0) + 1 FROM "{SONGS_TABLENAME}"')
+        next_song_id = int(cur.fetchone()[0] or 1)
+        cur.execute(
+            "SELECT setval(pg_get_serial_sequence(%s, %s), %s, false)",
+            (SONGS_TABLENAME, FIELD_SONG_ID, next_song_id),
+        )
+        return next_song_id
 
     def __getstate__(self):
         return self._options,
