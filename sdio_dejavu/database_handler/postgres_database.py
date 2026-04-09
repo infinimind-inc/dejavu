@@ -12,6 +12,7 @@ from sdio_dejavu.config.settings import (FIELD_FILE_SHA1, FIELD_FINGERPRINTED,
                                     FINGERPRINTS_TABLENAME, SONGS_TABLENAME,DAILY_PARTITION)
 
 PK_SONG_ID_CONSTRAINT = f"pk_{SONGS_TABLENAME}_{FIELD_SONG_ID}"
+SONG_NAME_UNIQUE_INDEX = f"{SONGS_TABLENAME}_{FIELD_SONGNAME}_uk"
 
 
 class PostgreSQLDatabase(CommonDatabase):
@@ -32,7 +33,10 @@ class PostgreSQLDatabase(CommonDatabase):
         );
     """
 
-    CREATE_CREATIVE_TABLE_INDEX = f"""CREATE UNIQUE INDEX "idx_{SONGS_TABLENAME}_{FIELD_SONGNAME}" ON "{SONGS_TABLENAME}" ("{FIELD_SONGNAME}");"""
+    CREATE_CREATIVE_TABLE_INDEX = (
+        f'CREATE UNIQUE INDEX IF NOT EXISTS "{SONG_NAME_UNIQUE_INDEX}" '
+        f'ON "{SONGS_TABLENAME}" ("{FIELD_SONGNAME}");'
+    )
 
 
     CREATE_FINGERPRINTS_TABLE = f"""
@@ -271,6 +275,14 @@ class PostgreSQLDatabase(CommonDatabase):
         super().__init__()
         self.cursor = cursor_factory(**options)
         self._options = options
+
+    def setup(self) -> None:
+        super().setup()
+        self.ensure_song_name_unique_index()
+
+    def ensure_song_name_unique_index(self) -> None:
+        with self.cursor() as cur:
+            cur.execute(self.CREATE_CREATIVE_TABLE_INDEX)
     
     def ensure_daily_partition(self) -> None:
         if DAILY_PARTITION:
