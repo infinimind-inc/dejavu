@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import sys
+from dataclasses import dataclass
 from functools import lru_cache
 import traceback
 from itertools import groupby
@@ -21,6 +22,8 @@ from sdio_dejavu.config.settings import (
     DEFAULT_OVERLAP_RATIO,
     DEFAULT_WINDOW_SIZE, 
     FIELD_FILE_SHA1,
+    FIELD_FINGERPRINTED,
+    FIELD_OFFSET,
     FIELD_TOTAL_HASHES,
     FINGERPRINTED_CONFIDENCE,
     FINGERPRINTED_HASHES, 
@@ -34,11 +37,172 @@ from sdio_dejavu.config.settings import (
     TOPN,
     SONGS_TABLENAME,
     FIELD_HASH64,
+    FIELD_SONG_ID,
     FIELD_SONG_ID_FP,
     FINGERPRINTS_TABLENAME,
     )
 from sdio_dejavu.logic.fingerprint import fingerprint,filter_result,enrich_hash64
 from loguru import logger
+
+FP_SQL_MATCH_MIN_VOTES = 5
+FP_SQL_INPUT_CONFIDENCE_THRESHOLD = 0.3
+FP_SQL_STAGE1_MIN_VOTES = 2
+FP_SQL_FASTPATH_QUERY = f"""
+WITH input_hashes(hash64, input_offset) AS (
+    SELECT * FROM UNNEST(%s::bigint[], %s::int[])
+),
+offset_votes AS (
+    SELECT
+        f."{FIELD_SONG_ID}" AS song_id,
+        f."{FIELD_OFFSET}" - i.input_offset AS offset_diff,
+        COUNT(*) AS vote_count
+    FROM "{FINGERPRINTS_TABLENAME}" f
+    JOIN input_hashes i
+      ON f."{FIELD_HASH64}" = i.hash64
+    GROUP BY f."{FIELD_SONG_ID}", f."{FIELD_OFFSET}" - i.input_offset
+),
+song_votes AS (
+    SELECT
+        song_id,
+        SUM(vote_count) AS hashes_matched
+    FROM offset_votes
+    GROUP BY song_id
+    HAVING SUM(vote_count) >= %s
+),
+ranked AS (
+    SELECT
+        ov.song_id,
+        ov.offset_diff,
+        ov.vote_count,
+        sv.hashes_matched,
+        ROW_NUMBER() OVER (
+            PARTITION BY ov.song_id
+            ORDER BY ov.vote_count DESC, ABS(ov.offset_diff) ASC
+        ) AS rn
+    FROM offset_votes ov
+    JOIN song_votes sv
+      ON ov.song_id = sv.song_id
+)
+SELECT c."{SONG_NAME}"
+     , r.hashes_matched
+     , c."{FIELD_TOTAL_HASHES}"
+     , r.offset_diff
+FROM ranked r
+JOIN "{SONGS_TABLENAME}" c
+  ON c."{FIELD_SONG_ID}" = r.song_id
+WHERE r.rn = 1
+  AND c."{FIELD_FINGERPRINTED}" = 1;
+"""
+
+FP_SQL_FASTPATH_CANDIDATE_QUERY = f"""
+WITH input_hashes(hash64, input_offset) AS (
+    SELECT * FROM UNNEST(%s::bigint[], %s::int[])
+),
+candidate_song_ids(song_id) AS (
+    SELECT * FROM UNNEST(%s::bigint[])
+),
+offset_votes AS (
+    SELECT
+        f."{FIELD_SONG_ID}" AS song_id,
+        f."{FIELD_OFFSET}" - i.input_offset AS offset_diff,
+        COUNT(*) AS vote_count
+    FROM "{FINGERPRINTS_TABLENAME}" f
+    JOIN input_hashes i
+      ON f."{FIELD_HASH64}" = i.hash64
+    JOIN candidate_song_ids c
+      ON c.song_id = f."{FIELD_SONG_ID}"
+    GROUP BY f."{FIELD_SONG_ID}", f."{FIELD_OFFSET}" - i.input_offset
+),
+song_votes AS (
+    SELECT
+        song_id,
+        SUM(vote_count) AS hashes_matched
+    FROM offset_votes
+    GROUP BY song_id
+    HAVING SUM(vote_count) >= %s
+),
+ranked AS (
+    SELECT
+        ov.song_id,
+        ov.offset_diff,
+        ov.vote_count,
+        sv.hashes_matched,
+        ROW_NUMBER() OVER (
+            PARTITION BY ov.song_id
+            ORDER BY ov.vote_count DESC, ABS(ov.offset_diff) ASC
+        ) AS rn
+    FROM offset_votes ov
+    JOIN song_votes sv
+      ON ov.song_id = sv.song_id
+)
+SELECT c."{SONG_NAME}"
+     , r.hashes_matched
+     , c."{FIELD_TOTAL_HASHES}"
+     , r.offset_diff
+FROM ranked r
+JOIN "{SONGS_TABLENAME}" c
+  ON c."{FIELD_SONG_ID}" = r.song_id
+WHERE r.rn = 1
+  AND c."{FIELD_FINGERPRINTED}" = 1;
+"""
+
+FP_SQL_HASH_FREQ_QUERY = f"""
+WITH query_hashes(hash64) AS (
+    SELECT DISTINCT * FROM UNNEST(%s::bigint[])
+)
+SELECT q.hash64, COUNT(f."{FIELD_SONG_ID}") AS db_freq
+FROM query_hashes q
+LEFT JOIN "{FINGERPRINTS_TABLENAME}" f
+  ON f."{FIELD_HASH64}" = q.hash64
+GROUP BY q.hash64;
+"""
+
+FP_SQL_STAGE1_CANDIDATE_QUERY = f"""
+WITH input_hashes(hash64, input_offset) AS (
+    SELECT * FROM UNNEST(%s::bigint[], %s::int[])
+),
+offset_votes AS (
+    SELECT
+        f."{FIELD_SONG_ID}" AS song_id,
+        f."{FIELD_OFFSET}" - i.input_offset AS offset_diff,
+        COUNT(*) AS vote_count
+    FROM "{FINGERPRINTS_TABLENAME}" f
+    JOIN input_hashes i
+      ON f."{FIELD_HASH64}" = i.hash64
+    GROUP BY f."{FIELD_SONG_ID}", f."{FIELD_OFFSET}" - i.input_offset
+),
+song_votes AS (
+    SELECT
+        song_id,
+        SUM(vote_count) AS hashes_matched,
+        MAX(vote_count) AS best_vote_count
+    FROM offset_votes
+    GROUP BY song_id
+    HAVING SUM(vote_count) >= %s
+)
+SELECT song_id
+FROM song_votes
+ORDER BY hashes_matched DESC, best_vote_count DESC, song_id
+LIMIT %s;
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class FingerprintSQLTwoStageConfig:
+    candidate_hash_count: int = 0
+    candidate_song_limit: int = 0
+    candidate_min_votes: int = FP_SQL_STAGE1_MIN_VOTES
+
+    @property
+    def enabled(self) -> bool:
+        return self.candidate_hash_count > 0 and self.candidate_song_limit > 0
+
+    def normalized(self) -> "FingerprintSQLTwoStageConfig":
+        return FingerprintSQLTwoStageConfig(
+            candidate_hash_count=max(0, int(self.candidate_hash_count)),
+            candidate_song_limit=max(0, int(self.candidate_song_limit)),
+            candidate_min_votes=max(1, int(self.candidate_min_votes)),
+        )
 
 class Dejavu:
     def __init__(self, config):
@@ -55,6 +219,7 @@ class Dejavu:
         self.limit = self.config.get("fingerprint_limit", None)
         if self.limit == -1:  # for JSON compatibility
             self.limit = None
+        self._duration_cache: dict[str, int] = {}
         #self.__load_fingerprinted_audio_hashes()
 
     def __load_fingerprinted_audio_hashes(self) -> None:
@@ -334,6 +499,227 @@ class Dejavu:
         start = int(parts[-2])
         end = int(parts[-1])
         return end - start
+
+    def _parse_duration_cached(self, cm_id: str) -> int:
+        duration = self._duration_cache.get(cm_id)
+        if duration is None:
+            duration = self.parse_duration(cm_id)
+            self._duration_cache[cm_id] = duration
+        return duration
+
+    @staticmethod
+    def _set_local_work_mem(cur, query_work_mem_mb: int | None) -> None:
+        if query_work_mem_mb is not None and query_work_mem_mb > 0:
+            cur.execute(f"SET LOCAL work_mem = '{int(query_work_mem_mb)}MB'")
+
+    def _lookup_hash_frequencies(
+            self,
+            hash64_list: list[int],
+            query_work_mem_mb: int | None = None,
+        ) -> dict[int, int]:
+        unique_hashes = list(dict.fromkeys(int(hash64) for hash64 in hash64_list))
+        if not unique_hashes:
+            return {}
+
+        with self.db.cursor() as cur:
+            self._set_local_work_mem(cur, query_work_mem_mb)
+            cur.execute(FP_SQL_HASH_FREQ_QUERY, (unique_hashes,))
+            return {int(hash64): int(db_freq) for hash64, db_freq in cur}
+
+    def _select_stage1_hashes(
+            self,
+            hashes: list[Tuple[int, int]],
+            sql_two_stage: FingerprintSQLTwoStageConfig,
+            query_work_mem_mb: int | None = None,
+        ) -> tuple[list[Tuple[int, int]], int]:
+        unique_hashes = list(dict.fromkeys(int(hash64) for hash64, _ in hashes))
+        if len(unique_hashes) <= sql_two_stage.candidate_hash_count:
+            return hashes, len(unique_hashes)
+
+        hash_freqs = self._lookup_hash_frequencies(unique_hashes, query_work_mem_mb=query_work_mem_mb)
+        selected_hash64s = set(
+            sorted(unique_hashes, key=lambda h: (hash_freqs.get(h, 0), h))[:sql_two_stage.candidate_hash_count]
+        )
+        selected_hashes = [(int(hash64), int(offset)) for hash64, offset in hashes if int(hash64) in selected_hash64s]
+        return selected_hashes, len(selected_hash64s)
+
+    def _fetch_stage1_candidate_song_ids(
+            self,
+            hashes: list[Tuple[int, int]],
+            sql_two_stage: FingerprintSQLTwoStageConfig,
+            query_work_mem_mb: int | None = None,
+        ) -> list[int]:
+        if not hashes:
+            return []
+
+        hash64_list = [int(hash64) for hash64, _ in hashes]
+        offset_list = [int(offset) for _, offset in hashes]
+        with self.db.cursor() as cur:
+            self._set_local_work_mem(cur, query_work_mem_mb)
+            cur.execute(
+                FP_SQL_STAGE1_CANDIDATE_QUERY,
+                (
+                    hash64_list,
+                    offset_list,
+                    sql_two_stage.candidate_min_votes,
+                    sql_two_stage.candidate_song_limit + 1,
+                ),
+            )
+            return [int(song_id) for (song_id,) in cur]
+
+    def _run_sql_fastpath_query(
+            self,
+            hashes: list[Tuple[int, int]],
+            min_votes: int = FP_SQL_MATCH_MIN_VOTES,
+            candidate_song_ids: list[int] | None = None,
+            query_work_mem_mb: int | None = None,
+        ) -> list[tuple[object, int, int, int]]:
+        if not hashes:
+            return []
+
+        hash64_list = [int(hash64) for hash64, _ in hashes]
+        offset_list = [int(offset) for _, offset in hashes]
+        query = FP_SQL_FASTPATH_CANDIDATE_QUERY if candidate_song_ids else FP_SQL_FASTPATH_QUERY
+
+        if candidate_song_ids:
+            params = (hash64_list, offset_list, [int(song_id) for song_id in candidate_song_ids], min_votes)
+        else:
+            params = (hash64_list, offset_list, min_votes)
+
+        with self.db.cursor() as cur:
+            self._set_local_work_mem(cur, query_work_mem_mb)
+            cur.execute(query, params)
+            return list(cur)
+
+    def _get_similar_cm_ids_hash64_sql_fast(
+            self,
+            cm_id: str,
+            threshold: float,
+            verbose: bool,
+            hashes: list[Tuple[int, int]] | None = None,
+            query_work_mem_mb: int | None = None,
+            sql_two_stage: FingerprintSQLTwoStageConfig | None = None,
+        ) -> list[str]:
+        metrics: dict[str, float] = {}
+        details: dict[str, int | str] = {}
+
+        t_now = time.perf_counter()
+        duration = self._parse_duration_cached(cm_id)
+        metrics["parse_origin_duration"] = time.perf_counter() - t_now
+
+        t_now = time.perf_counter()
+        if hashes is None:
+            hashes = self.db.get_fingerprints_by_song_name(cm_id)
+        metrics["get_fingerprints"] = time.perf_counter() - t_now
+        if not hashes:
+            return []
+
+        sql_two_stage = (sql_two_stage or FingerprintSQLTwoStageConfig()).normalized()
+        queried_hashes = len(hashes)
+        raw_rows: list[tuple[object, int, int, int]] = []
+        details["queried_hashes"] = queried_hashes
+
+        if sql_two_stage.enabled:
+            details["stage1_candidate_hash_count"] = sql_two_stage.candidate_hash_count
+            details["stage1_candidate_song_limit"] = sql_two_stage.candidate_song_limit
+
+            t_now = time.perf_counter()
+            stage1_hashes, selected_unique_hashes = self._select_stage1_hashes(
+                hashes,
+                sql_two_stage=sql_two_stage,
+                query_work_mem_mb=query_work_mem_mb,
+            )
+            metrics["stage1_select_hashes"] = time.perf_counter() - t_now
+            details["stage1_selected_hashes"] = len(stage1_hashes)
+            details["stage1_selected_unique_hashes"] = selected_unique_hashes
+
+            if stage1_hashes and len(stage1_hashes) < len(hashes):
+                t_now = time.perf_counter()
+                candidate_song_ids = self._fetch_stage1_candidate_song_ids(
+                    stage1_hashes,
+                    sql_two_stage=sql_two_stage,
+                    query_work_mem_mb=query_work_mem_mb,
+                )
+                metrics["stage1_candidate_query"] = time.perf_counter() - t_now
+                details["stage1_candidates"] = len(candidate_song_ids)
+
+                if len(candidate_song_ids) > sql_two_stage.candidate_song_limit:
+                    details["stage1_fallback"] = "candidate_limit_hit"
+                elif candidate_song_ids:
+                    t_now = time.perf_counter()
+                    raw_rows = self._run_sql_fastpath_query(
+                        hashes,
+                        min_votes=FP_SQL_MATCH_MIN_VOTES,
+                        candidate_song_ids=candidate_song_ids,
+                        query_work_mem_mb=query_work_mem_mb,
+                    )
+                    metrics["sql_fast_path_stage2"] = time.perf_counter() - t_now
+                else:
+                    details["stage1_fallback"] = "no_candidates"
+            else:
+                details["stage1_fallback"] = "insufficient_hash_reduction"
+
+        if not raw_rows:
+            t_now = time.perf_counter()
+            raw_rows = self._run_sql_fastpath_query(
+                hashes,
+                min_votes=FP_SQL_MATCH_MIN_VOTES,
+                candidate_song_ids=None,
+                query_work_mem_mb=query_work_mem_mb,
+            )
+            metrics["sql_fast_path"] = time.perf_counter() - t_now
+
+        t_now = time.perf_counter()
+        candidates: list[tuple[str, float, int, int]] = []
+        for song_name, hashes_matched, total_hashes, offset_diff in raw_rows:
+            total_hashes = int(total_hashes)
+            hashes_matched = int(hashes_matched)
+            if total_hashes <= 0:
+                continue
+
+            input_confidence = round(hashes_matched / queried_hashes, 2)
+            fingerprinted_confidence = round(hashes_matched / total_hashes, 2)
+            if fingerprinted_confidence < threshold:
+                continue
+            if input_confidence < FP_SQL_INPUT_CONFIDENCE_THRESHOLD:
+                continue
+
+            if isinstance(song_name, (bytes, bytearray)):
+                normalized_song_name = song_name.decode("utf-8", errors="ignore")
+            elif hasattr(song_name, "tobytes"):
+                normalized_song_name = song_name.tobytes().decode("utf-8", errors="ignore")
+            else:
+                normalized_song_name = str(song_name)
+
+            candidates.append((
+                normalized_song_name,
+                input_confidence,
+                hashes_matched,
+                int(offset_diff),
+            ))
+
+        candidates.sort(key=lambda x: (-x[1], -x[2], abs(x[3]), x[0]))
+        raw_matches = [song_name for song_name, _, _, _ in candidates]
+        metrics["python_filter_sort"] = time.perf_counter() - t_now
+
+        t_now = time.perf_counter()
+        match_names = []
+        for other in raw_matches:
+            if other == cm_id:
+                continue
+
+            duration_other = self._parse_duration_cached(other)
+            if self.is_duration_compatible(duration, duration_other):
+                match_names.append(other)
+        metrics["post_process_filter"] = time.perf_counter() - t_now
+
+        if verbose:
+            log_msg = " | ".join([f"{k}: {v:.3f}s" for k, v in metrics.items()])
+            if details:
+                log_msg = f"{log_msg} | " + " | ".join([f"{k}: {v}" for k, v in details.items()])
+            logger.debug(f"[FP SQL FastPath] Performance Metrics: {log_msg}")
+
+        return match_names
     
     def is_duration_compatible(self, d1: int, d2: int,
                            min_ratio: float = 0.9,
@@ -402,19 +788,38 @@ class Dejavu:
             threshold: float = 0.3,
             use_unnest: bool = False,
             verbose: bool = False,
-            hashes: list[Tuple[str,str]] = None,
+            hashes: list[Tuple[int, int]] = None,
+            query_work_mem_mb: int | None = None,
+            sql_two_stage: FingerprintSQLTwoStageConfig | None = None,
             ) -> list[str]:
-        
+        if use_unnest:
+            try:
+                match_names = self._get_similar_cm_ids_hash64_sql_fast(
+                    cm_id=cm_id,
+                    threshold=threshold,
+                    verbose=verbose,
+                    hashes=hashes,
+                    query_work_mem_mb=query_work_mem_mb,
+                    sql_two_stage=sql_two_stage,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Fingerprint SQL fast path failed for {}. Falling back to legacy Dejavu path: {}",
+                    cm_id,
+                    e,
+                )
+                match_names = None
+            else:
+                return match_names
+
         metrics = {}
         
         start = time.time()
-        duration = self.parse_duration(cm_id)
+        duration = self._parse_duration_cached(cm_id)
         metrics["parse_origin_duration"] = time.time() - start
         
         t_now = time.time()
-        if hashes:
-            pass
-        else:
+        if hashes is None:
             hashes = self.db.get_fingerprints_by_song_name(cm_id)
         metrics["get_fingerprints"] = time.time() - t_now
         
@@ -442,7 +847,7 @@ class Dejavu:
             if other == cm_id:
                 continue
 
-            duration_other = self.parse_duration(other)
+            duration_other = self._parse_duration_cached(other)
             if self.is_duration_compatible(duration, duration_other):
                 match_names.append(other)
         metrics["post_process_filter"] = time.time() - t_now
