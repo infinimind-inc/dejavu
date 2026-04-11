@@ -88,7 +88,7 @@ class PostgreSQLDatabase(CommonDatabase):
     """
 
     CREATE_FINGERPRINTS_TABLE_INDEX_ALL = f"""
-    CREATE INDEX CONCURRENTLY idx_fingerprints_lookup_optimized 
+    CREATE INDEX IF NOT EXISTS idx_fingerprints_lookup_optimized
     ON {FINGERPRINTS_TABLENAME} ({FIELD_HASH64}) 
     INCLUDE ({FIELD_SONG_ID}, "{FIELD_OFFSET}");"""
 
