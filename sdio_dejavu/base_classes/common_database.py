@@ -146,14 +146,18 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
 
         return count
 
-    def set_song_fingerprinted(self, song_id):
+    def set_song_fingerprinted(self, song_id, cur=None):
         """
         Sets a specific song as having all fingerprints in the database.
 
         :param song_id: song identifier.
         """
-        with self.cursor() as cur:
+        if cur is not None:
             cur.execute(self.UPDATE_SONG_FINGERPRINTED, (song_id,))
+            return
+
+        with self.cursor() as db_cur:
+            db_cur.execute(self.UPDATE_SONG_FINGERPRINTED, (song_id,))
 
     def get_songs(self) -> List[Dict[str, str]]:
         """
@@ -267,7 +271,7 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
             cur.execute(self.INSERT_FINGERPRINT, (fingerprint, song_id, offset))
 
     @abc.abstractmethod
-    def insert_song(self, song_name: str, file_hash: str, total_hashes: int) -> int:
+    def insert_song(self, song_name: str, file_hash: str, total_hashes: int, cur=None) -> int:
         """
         Inserts a song name into the database, returns the new
         identifier of the song.
@@ -308,7 +312,13 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         """
         return self.query(None)
 
-    def insert_hashes(self, song_id: int, hashes: list[Tuple[str, int,int]], batch_size: int = 1000) -> None:
+    def insert_hashes(
+        self,
+        song_id: int,
+        hashes: list[Tuple[str, int, int]],
+        batch_size: int = 1000,
+        cur=None,
+    ) -> None:
         """
         Insert a multitude of fingerprints.
 
@@ -321,9 +331,30 @@ class CommonDatabase(BaseDatabase, metaclass=abc.ABCMeta):
         self.ensure_daily_partition()
         values = [(song_id, hsh, hsh_64,int(offset)) for hsh, hsh_64,offset in hashes]
 
+        if cur is not None:
+            for index in range(0, len(values), batch_size):
+                execute_batch(cur, self.INSERT_FINGERPRINT, values[index: index + batch_size], batch_size)
+            return
+
+        with self.cursor() as db_cur:
+            for index in range(0, len(values), batch_size):
+                execute_batch(db_cur, self.INSERT_FINGERPRINT, values[index: index + batch_size], batch_size)
+
+    def insert_song_with_hashes(
+        self,
+        song_name: str,
+        file_hash: str,
+        hashes: list[Tuple[str, int, int]],
+        batch_size: int = 1000,
+    ) -> int:
+        """
+        Insert the song row and all fingerprint rows in a single DB transaction.
+        """
         with self.cursor() as cur:
-            for index in range(0, len(hashes), batch_size):
-                execute_batch(cur,self.INSERT_FINGERPRINT, values[index: index + batch_size],batch_size)
+            sid = self.insert_song(song_name, file_hash, len(hashes), cur=cur)
+            self.insert_hashes(sid, hashes, batch_size=batch_size, cur=cur)
+            self.set_song_fingerprinted(sid, cur=cur)
+            return sid
 
     def return_matches(self, hashes: List[Tuple[str, int]],
                        batch_size: int = 1000) -> Tuple[List[Tuple[int, int]], Dict[int, int]]:

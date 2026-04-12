@@ -67,7 +67,7 @@ class BaseDatabase(object, metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractmethod
-    def set_song_fingerprinted(self, song_id: int):
+    def set_song_fingerprinted(self, song_id: int, cur=None):
         """
         Sets a specific song as having all fingerprints in the database.
 
@@ -106,7 +106,7 @@ class BaseDatabase(object, metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractmethod
-    def insert_song(self, song_name: str, file_hash: str, total_hashes: int) -> int:
+    def insert_song(self, song_name: str, file_hash: str, total_hashes: int, cur=None) -> int:
         """
         Inserts a song name into the database, returns the new
         identifier of the song.
@@ -114,6 +114,25 @@ class BaseDatabase(object, metaclass=abc.ABCMeta):
         :param song_name: The name of the song.
         :param file_hash: Hash from the fingerprinted file.
         :param total_hashes: amount of hashes to be inserted on fingerprint table.
+        :return: the inserted id.
+        """
+        pass
+
+    @abc.abstractmethod
+    def insert_song_with_hashes(
+        self,
+        song_name: str,
+        file_hash: str,
+        hashes: List[Tuple[str, int]],
+        batch_size: int = 1000,
+    ) -> int:
+        """
+        Inserts a song and all its fingerprints within a single transaction.
+
+        :param song_name: The name of the song.
+        :param file_hash: Hash from the fingerprinted file.
+        :param hashes: fingerprints that belong to the song.
+        :param batch_size: insert batches.
         :return: the inserted id.
         """
         pass
@@ -139,7 +158,13 @@ class BaseDatabase(object, metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractmethod
-    def insert_hashes(self, song_id: int, hashes: List[Tuple[str, int]], batch_size: int = 1000) -> None:
+    def insert_hashes(
+        self,
+        song_id: int,
+        hashes: List[Tuple[str, int]],
+        batch_size: int = 1000,
+        cur=None,
+    ) -> None:
         """
         Insert a multitude of fingerprints.
 

@@ -300,11 +300,7 @@ class Dejavu:
                 filename = submitted[fut]
                 try:
                     song_name, hashes, file_hash = fut.result(timeout=timeout_s)
-
-                    with self.db.cursor():
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes))
-                        self.db.insert_hashes(sid, hashes)
-                        self.db.set_song_fingerprinted(sid)
+                    self.db.insert_song_with_hashes(song_name, file_hash, hashes)
 
                 except concurrent.futures.TimeoutError:
                     logger.error(f"[FP] timeout: {filename}")
@@ -361,11 +357,7 @@ class Dejavu:
                 fn = submitted[fut]
                 try:
                     song_name, hashes, file_hash = fut.result(timeout=timeout_s)
-                    # DB writes in parent only (good). Wrap in retry + timeout.
-                    with self.db.cursor() as cur:
-                        sid = self.db.insert_song(song_name, file_hash, len(hashes))
-                        self.db.insert_hashes(sid, hashes)
-                        self.db.set_song_fingerprinted(sid)
+                    self.db.insert_song_with_hashes(song_name, file_hash, hashes)
                     completed += 1
                     if completed % 50 == 0:
                         logger.info(f"[FP] progress: {completed}/{len(futures)} (elapsed {time.perf_counter()-start_time:.1f}s)")
@@ -427,10 +419,7 @@ class Dejavu:
                 # Print traceback because we can't reraise it here
                 traceback.print_exc(file=sys.stdout)
             else:
-                sid = self.db.insert_song(song_name, file_hash, len(hashes))
-
-                self.db.insert_hashes(sid, hashes)
-                self.db.set_song_fingerprinted(sid)
+                self.db.insert_song_with_hashes(song_name, file_hash, hashes)
                 #self.__load_fingerprinted_audio_hashes()
 
         pool.close()
@@ -459,21 +448,13 @@ class Dejavu:
         :param song_name: song name associated to the audio file.
         """
         song_name_from_path = decoder.get_audio_name_from_path(file_path)
-        song_hash = decoder.unique_hash(file_path)
         song_name = song_name or song_name_from_path
         # don't refingerprint already fingerprinted files
         #if song_hash in self.songhashes_set:
         #    logger.info(f"{song_name} already fingerprinted, continuing...")
         #else:
-        song_name, hashes, file_hash = Dejavu._fingerprint_worker(
-            file_path,
-            self.limit,
-            song_name=song_name
-        )
-        sid = self.db.insert_song(song_name, file_hash)
-
-        self.db.insert_hashes(sid, hashes)
-        self.db.set_song_fingerprinted(sid)
+        _, hashes, file_hash = Dejavu._fingerprint_worker((file_path, self.limit))
+        self.db.insert_song_with_hashes(song_name, file_hash, hashes)
         #self.__load_fingerprinted_audio_hashes()
 
     def generate_fingerprints(self, samples: List[int], Fs=DEFAULT_FS) -> Tuple[List[Tuple[str, int]], float]:
@@ -1225,7 +1206,7 @@ class Dejavu:
 
             fingerprints |= set(hashes)
 
-        return hashes, file_hash
+        return fingerprints, file_hash
     
     @staticmethod
     def get_np_fingerprints(
