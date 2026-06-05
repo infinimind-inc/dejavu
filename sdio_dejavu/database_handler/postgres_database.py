@@ -1,6 +1,8 @@
 import queue
+import time
 
 import psycopg2
+from psycopg2 import sql
 from psycopg2 import extensions
 from psycopg2.extras import DictCursor
 from loguru import logger
@@ -24,6 +26,7 @@ FINGERPRINT_LOOKUP_INDEX = (
     else f"idx_{FINGERPRINTS_TABLENAME}_lookup_optimized"
 )
 FINGERPRINT_INDEX_LAYOUT_LOCK = 2026041202
+FINGERPRINT_MAINTENANCE_LOCK = 2026060501
 
 
 class PostgreSQLDatabase(CommonDatabase):
@@ -509,6 +512,48 @@ class PostgreSQLDatabase(CommonDatabase):
             (SONGS_TABLENAME, FIELD_SONG_ID, next_song_id),
         )
         return next_song_id
+
+    def vacuum_analyze_fingerprint_tables(self, verbose: bool = False) -> bool:
+        """
+        Refresh PostgreSQL storage and planner stats for Dejavu tables.
+
+        VACUUM must run outside a transaction block, so this method uses a
+        dedicated autocommit connection instead of the pooled cursor helper.
+        """
+        options = "ANALYZE, VERBOSE" if verbose else "ANALYZE"
+        tables = (FINGERPRINTS_TABLENAME, SONGS_TABLENAME)
+        start_time = time.perf_counter()
+        conn = psycopg2.connect(**self._options)
+        conn.autocommit = True
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s);", (FINGERPRINT_MAINTENANCE_LOCK,))
+                lock_acquired = bool(cur.fetchone()[0])
+                if not lock_acquired:
+                    logger.info("[FP][DB] fingerprint table maintenance already running; skipping.")
+                    return False
+
+                try:
+                    logger.info("[FP][DB] starting VACUUM ({}) for tables={}", options, tables)
+                    for table_name in tables:
+                        cur.execute(
+                            sql.SQL("VACUUM ({}) {};").format(
+                                sql.SQL(options),
+                                sql.Identifier(table_name),
+                            )
+                        )
+                    logger.info(
+                        "[FP][DB] finished VACUUM ({}) in {:.1f}s for tables={}",
+                        options,
+                        time.perf_counter() - start_time,
+                        tables,
+                    )
+                    return True
+                finally:
+                    cur.execute("SELECT pg_advisory_unlock(%s);", (FINGERPRINT_MAINTENANCE_LOCK,))
+        finally:
+            conn.close()
 
     def __getstate__(self):
         return self._options,

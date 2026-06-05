@@ -249,6 +249,16 @@ class Dejavu:
         :param song_ids: song ids to delete from the database.
         """
         self.db.delete_songs_by_id(song_ids)
+
+    def vacuum_analyze(self, verbose: bool = False) -> bool:
+        """
+        Run PostgreSQL maintenance for Dejavu fingerprint tables.
+
+        Returns False when another maintenance run already holds the advisory lock.
+        """
+        if not hasattr(self.db, "vacuum_analyze_fingerprint_tables"):
+            raise NotImplementedError("VACUUM/ANALYZE maintenance is only supported for PostgreSQL.")
+        return self.db.vacuum_analyze_fingerprint_tables(verbose=verbose)
     
     def fingerprint_media_list(
         self,
