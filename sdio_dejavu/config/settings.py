@@ -34,7 +34,7 @@ DATABASES = {
 }
 
 # TABLE SONGS
-SONGS_TABLENAME = "fp_creatives_prod"
+SONGS_TABLENAME = "fp_creatives_test"
 
 # SONGS FIELDS
 FIELD_SONG_ID = 'song_id'
@@ -44,7 +44,7 @@ FIELD_FILE_SHA1 = 'file_sha1'
 FIELD_TOTAL_HASHES = 'total_hashes'
 
 # TABLE FINGERPRINTS
-FINGERPRINTS_TABLENAME = "fp_audio_fingerprints_prod"
+FINGERPRINTS_TABLENAME = "fp_audio_fingerprints_test"
 
 # FINGERPRINTS FIELDS
 FIELD_HASH = 'hash'
