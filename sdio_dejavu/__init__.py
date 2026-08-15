@@ -233,9 +233,10 @@ class Dejavu:
 
         The report covers the configured creative and fingerprint tables:
 
-        * exact row counts and the first/last ``date_created`` values;
-        * rows grouped by the inferred ``YYYYMMDD`` date in ``song_name`` for each
-          of the last ``days`` calendar days;
+        * an exact row count for the creative table and a catalog estimate for the
+          large fingerprint table;
+        * rows grouped by the inferred ``YYYYMMDD`` date in ``song_name`` for the
+          creative table only;
         * table, index, and total relation sizes.
 
         This method reuses the database connection initialized for this instance.
@@ -281,8 +282,27 @@ class Dejavu:
             for table_key, table_name in table_names.items():
                 table = _table_reference(table_name)
                 relation = sql.Literal(f"{schema}.{table_name}")
-                cur.execute(
-                    sql.SQL(
+                if table_key == "fingerprints":
+                    # Avoid a heap scan on the large fingerprint table. reltuples is
+                    # PostgreSQL's planner estimate and is refreshed by ANALYZE/VACUUM.
+                    stats_query = sql.SQL(
+                        """
+                        SELECT
+                            GREATEST(c.reltuples, 0)::bigint,
+                            NULL::timestamp,
+                            NULL::timestamp,
+                            pg_relation_size({relation}::regclass)::bigint,
+                            pg_indexes_size({relation}::regclass)::bigint,
+                            pg_total_relation_size({relation}::regclass)::bigint,
+                            pg_size_pretty(pg_relation_size({relation}::regclass)),
+                            pg_size_pretty(pg_indexes_size({relation}::regclass)),
+                            pg_size_pretty(pg_total_relation_size({relation}::regclass))
+                        FROM pg_class AS c
+                        WHERE c.oid = {relation}::regclass
+                        """
+                    ).format(relation=relation)
+                else:
+                    stats_query = sql.SQL(
                         """
                         SELECT
                             COUNT(*)::bigint,
@@ -297,7 +317,8 @@ class Dejavu:
                         FROM {table}
                         """
                     ).format(table=table, relation=relation)
-                )
+
+                cur.execute(stats_query)
                 (
                     total_row_count,
                     first_created_at,
@@ -311,56 +332,44 @@ class Dejavu:
                 ) = cur.fetchone()
 
                 if table_key == "songs":
-                    inferred_rows = sql.SQL(
-                        """
-                        SELECT (regexp_replace(t."song_name", %s, %s))::date AS inferred_date
-                        FROM {table} AS t
-                        WHERE t."song_name" ~ %s
-                        """
-                    ).format(table=table)
+                    cur.execute(
+                        sql.SQL(
+                            """
+                            WITH calendar_days AS (
+                                SELECT generate_series(
+                                    CURRENT_DATE - (%s - 1) * INTERVAL '1 day',
+                                    CURRENT_DATE,
+                                    INTERVAL '1 day'
+                                )::date AS day
+                            ),
+                            inferred_rows AS (
+                                SELECT (regexp_replace(t."song_name", %s, %s))::date AS inferred_date
+                                FROM {table} AS t
+                                WHERE t."song_name" ~ %s
+                            )
+                            SELECT
+                                calendar_days.day,
+                                COUNT(inferred_rows.inferred_date)::bigint AS row_count
+                            FROM calendar_days
+                            LEFT JOIN inferred_rows
+                              ON inferred_rows.inferred_date = calendar_days.day
+                            GROUP BY calendar_days.day
+                            ORDER BY calendar_days.day
+                            """
+                        ).format(table=table),
+                        (days, r"^.*_([0-9]{8})_.*$", r"\1", r"^.*_([0-9]{8})_.*$"),
+                    )
+                    daily_rows = [
+                        {"date": day.isoformat(), "row_count": int(daily_count)}
+                        for day, daily_count in cur.fetchall()
+                    ]
                 else:
-                    songs_table = _table_reference(SONGS_TABLENAME)
-                    inferred_rows = sql.SQL(
-                        """
-                        SELECT (regexp_replace(s."song_name", %s, %s))::date AS inferred_date
-                        FROM {table} AS f
-                        JOIN {songs_table} AS s
-                          ON s."song_id" = f."song_id"
-                        WHERE s."song_name" ~ %s
-                        """
-                    ).format(table=table, songs_table=songs_table)
-
-                cur.execute(
-                    sql.SQL(
-                        """
-                        WITH calendar_days AS (
-                            SELECT generate_series(
-                                CURRENT_DATE - (%s - 1) * INTERVAL '1 day',
-                                CURRENT_DATE,
-                                INTERVAL '1 day'
-                            )::date AS day
-                        ),
-                        inferred_rows AS ({inferred_rows})
-                        SELECT
-                            calendar_days.day,
-                            COUNT(inferred_rows.inferred_date)::bigint AS row_count
-                        FROM calendar_days
-                        LEFT JOIN inferred_rows
-                          ON inferred_rows.inferred_date = calendar_days.day
-                        GROUP BY calendar_days.day
-                        ORDER BY calendar_days.day
-                        """
-                    ).format(inferred_rows=inferred_rows),
-                    (days, r"^.*_([0-9]{8})_.*$", r"\1", r"^.*_([0-9]{8})_.*$"),
-                )
-                daily_rows = [
-                    {"date": day.isoformat(), "row_count": int(daily_count)}
-                    for day, daily_count in cur.fetchall()
-                ]
+                    daily_rows = []
 
                 report["tables"][table_key] = {
                     "table_name": table_name,
                     "row_count": int(total_row_count),
+                    "row_count_is_estimate": table_key == "fingerprints",
                     "first_created_at": _serialize_timestamp(first_created_at),
                     "last_created_at": _serialize_timestamp(last_created_at),
                     "size": {
