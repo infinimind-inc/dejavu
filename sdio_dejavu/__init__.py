@@ -13,6 +13,7 @@ import concurrent
 from collections import defaultdict, Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, timedelta
+from typing import Any
 import sdio_dejavu.logic.decoder as decoder
 from tqdm import tqdm
 from sdio_dejavu.base_classes.base_database import get_database
@@ -43,6 +44,7 @@ from sdio_dejavu.config.settings import (
     )
 from sdio_dejavu.logic.fingerprint import fingerprint,filter_result,enrich_hash64
 from loguru import logger
+
 
 FP_SQL_MATCH_MIN_VOTES = 5
 FP_SQL_INPUT_CONFIDENCE_THRESHOLD = 0.3
@@ -221,6 +223,157 @@ class Dejavu:
             self.limit = None
         self._duration_cache: dict[str, int] = {}
         #self.__load_fingerprinted_audio_hashes()
+
+    def analyze_fingerprint_database(
+        self,
+        days: int = 10,
+        schema: str = "public",
+    ) -> dict[str, Any]:
+        """Analyze the Dejavu fingerprint tables with read-only PostgreSQL queries.
+
+        The report covers the configured creative and fingerprint tables:
+
+        * exact row counts and the first/last ``date_created`` values;
+        * rows grouped by the inferred ``YYYYMMDD`` date in ``song_name`` for each
+          of the last ``days`` calendar days;
+        * table, index, and total relation sizes.
+
+        This method reuses the database connection initialized for this instance.
+        It intentionally does not call ``setup()`` and only executes ``SELECT``
+        queries. PostgreSQL is required because the size functions are PostgreSQL-
+        specific.
+
+        :param days: Number of calendar days to include, including today.
+        :param schema: PostgreSQL schema containing the fingerprint tables.
+        :return: A dictionary containing per-table statistics and daily row counts.
+        :raises ValueError: If the database is not PostgreSQL or ``days`` is invalid.
+        """
+        if getattr(self.db, "type", None) != "postgres":
+            raise ValueError("analyze_fingerprint_database requires PostgreSQL")
+        if days < 1:
+            raise ValueError("days must be at least 1")
+
+        from psycopg2 import sql
+
+        table_names = {
+            "songs": SONGS_TABLENAME,
+            "fingerprints": FINGERPRINTS_TABLENAME,
+        }
+
+        def _table_reference(table_name: str):
+            return sql.SQL("{}.{}").format(
+                sql.Identifier(schema),
+                sql.Identifier(table_name),
+            )
+
+        def _serialize_timestamp(value: Any) -> str | None:
+            return value.isoformat(sep=" ") if value is not None else None
+
+        report: dict[str, Any] = {
+            "database_type": "postgres",
+            "schema": schema,
+            "days": days,
+            "daily_date_source": "song_name inferred from ^.*_([0-9]{8})_.*$",
+            "tables": {},
+        }
+
+        with self.db.cursor() as cur:
+            for table_key, table_name in table_names.items():
+                table = _table_reference(table_name)
+                cur.execute(
+                    sql.SQL(
+                        """
+                        SELECT
+                            COUNT(*)::bigint,
+                            MIN("date_created"),
+                            MAX("date_created"),
+                            pg_relation_size({table})::bigint,
+                            pg_indexes_size({table})::bigint,
+                            pg_total_relation_size({table})::bigint,
+                            pg_size_pretty(pg_relation_size({table})),
+                            pg_size_pretty(pg_indexes_size({table})),
+                            pg_size_pretty(pg_total_relation_size({table}))
+                        FROM {table}
+                        """
+                    ).format(table=table)
+                )
+                (
+                    total_row_count,
+                    first_created_at,
+                    last_created_at,
+                    table_size_bytes,
+                    index_size_bytes,
+                    total_size_bytes,
+                    table_size,
+                    index_size,
+                    total_size,
+                ) = cur.fetchone()
+
+                if table_key == "songs":
+                    inferred_rows = sql.SQL(
+                        """
+                        SELECT (regexp_replace(t."song_name", %s, %s))::date AS inferred_date
+                        FROM {table} AS t
+                        WHERE t."song_name" ~ %s
+                        """
+                    ).format(table=table)
+                else:
+                    songs_table = _table_reference(SONGS_TABLENAME)
+                    inferred_rows = sql.SQL(
+                        """
+                        SELECT (regexp_replace(s."song_name", %s, %s))::date AS inferred_date
+                        FROM {table} AS f
+                        JOIN {songs_table} AS s
+                          ON s."song_id" = f."song_id"
+                        WHERE s."song_name" ~ %s
+                        """
+                    ).format(table=table, songs_table=songs_table)
+
+                cur.execute(
+                    sql.SQL(
+                        """
+                        WITH calendar_days AS (
+                            SELECT generate_series(
+                                CURRENT_DATE - (%s - 1) * INTERVAL '1 day',
+                                CURRENT_DATE,
+                                INTERVAL '1 day'
+                            )::date AS day
+                        ),
+                        inferred_rows AS ({inferred_rows})
+                        SELECT
+                            calendar_days.day,
+                            COUNT(inferred_rows.inferred_date)::bigint AS row_count
+                        FROM calendar_days
+                        LEFT JOIN inferred_rows
+                          ON inferred_rows.inferred_date = calendar_days.day
+                        GROUP BY calendar_days.day
+                        ORDER BY calendar_days.day
+                        """
+                    ).format(inferred_rows=inferred_rows),
+                    (days, r"^.*_([0-9]{8})_.*$", r"\1", r"^.*_([0-9]{8})_.*$"),
+                )
+                daily_rows = [
+                    {"date": day.isoformat(), "row_count": int(daily_count)}
+                    for day, daily_count in cur.fetchall()
+                ]
+
+                report["tables"][table_key] = {
+                    "table_name": table_name,
+                    "row_count": int(total_row_count),
+                    "first_created_at": _serialize_timestamp(first_created_at),
+                    "last_created_at": _serialize_timestamp(last_created_at),
+                    "size": {
+                        "table_bytes": int(table_size_bytes),
+                        "index_bytes": int(index_size_bytes),
+                        "total_bytes": int(total_size_bytes),
+                        "table": table_size,
+                        "indexes": index_size,
+                        "total": total_size,
+                    },
+                    "daily_rows": daily_rows,
+                }
+
+        return report
 
     def __load_fingerprinted_audio_hashes(self) -> None:
         """
