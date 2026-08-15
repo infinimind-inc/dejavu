@@ -280,6 +280,7 @@ class Dejavu:
         with self.db.cursor() as cur:
             for table_key, table_name in table_names.items():
                 table = _table_reference(table_name)
+                relation = sql.Literal(f"{schema}.{table_name}")
                 cur.execute(
                     sql.SQL(
                         """
@@ -287,15 +288,15 @@ class Dejavu:
                             COUNT(*)::bigint,
                             MIN("date_created"),
                             MAX("date_created"),
-                            pg_relation_size({table})::bigint,
-                            pg_indexes_size({table})::bigint,
-                            pg_total_relation_size({table})::bigint,
-                            pg_size_pretty(pg_relation_size({table})),
-                            pg_size_pretty(pg_indexes_size({table})),
-                            pg_size_pretty(pg_total_relation_size({table}))
+                            pg_relation_size({relation}::regclass)::bigint,
+                            pg_indexes_size({relation}::regclass)::bigint,
+                            pg_total_relation_size({relation}::regclass)::bigint,
+                            pg_size_pretty(pg_relation_size({relation}::regclass)),
+                            pg_size_pretty(pg_indexes_size({relation}::regclass)),
+                            pg_size_pretty(pg_total_relation_size({relation}::regclass))
                         FROM {table}
                         """
-                    ).format(table=table)
+                    ).format(table=table, relation=relation)
                 )
                 (
                     total_row_count,
