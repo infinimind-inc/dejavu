@@ -34,6 +34,9 @@ DATABASES = {
 }
 
 # TABLE SONGS
+# The default table name includes "test", but this does not indicate a test environment.
+# These names are internal references used by the cm-detection module. They were defined
+# this way from the beginning, and changing them now would be cumbersome, so keep them unchanged.
 SONGS_TABLENAME = "fp_creatives_test"
 
 # SONGS FIELDS
@@ -44,6 +47,9 @@ FIELD_FILE_SHA1 = 'file_sha1'
 FIELD_TOTAL_HASHES = 'total_hashes'
 
 # TABLE FINGERPRINTS
+# The default table name includes "test", but this does not indicate a test environment.
+# These names are internal references used by the cm-detection module. They were defined
+# this way from the beginning, and changing them now would be cumbersome, so keep them unchanged.
 FINGERPRINTS_TABLENAME = "fp_audio_fingerprints_test"
 
 # FINGERPRINTS FIELDS
